@@ -36,28 +36,32 @@
 #define USE_I2C true
 #define USE_CAMERA false
 #define USE_RADIO false
+#define USE_SD true
 // weather the system should wait for the GPS to have a time before starting.
-#define WAIT_FOR_TIME true
+#define WAIT_FOR_GPS true
 
-// TODO use SHARED_SPI mode when radio is added
-#define SD_CONFIG SdSpiConfig(IO_SD, DEDICATED_SPI, SD_SCK_MHZ(16))
 
-// sample delay for the sensors.
-#define SENSOR_SAMPLE_WAIT 2000
+#define SD_CONFIG SdSpiConfig(IO_SD, SHARED_SPI, SD_SCK_MHZ(16))
+
+// cycle hertz for the system. Basically its clock. Every time this is reached, a sensor sample is taken, and the various cycle counters for the below are incremented.
+#define CYCLE_MILLIHERTZ 2000
 // how many samples should be written to one file before swapping to next one.
-#define CYCLES_PER_FILE 30
-// how many sensor cycles to skip before doing a picture (e.g. 3x5000 = every 15s)
-#define CAMERA_SAMPLE_CYCLE_SKIP 10
-// how many cycles to wait for color updates
+#define CYCLES_PER_FILE 35
+// how many sensor cycles to skip before taking a picture (e.g. 3xSENSOR_SAMPLE_WAIT of 5000 = every 15s)
+#define CYCLES_PER_PIC 10
+// how many sensor cycles to skip before sending radio (same as above)
+#define CYCLES_PER_RX 5
+
+// how many cycles to wait for color updates (does not use the above clock system, much more random for efficiency)
 #define COLOR_UPD_SKIP 800
 // amount of times to try writing before dying.
 #define MAX_SD_TRIES 5
-// amount of times to send the radio data.
+// amount of times to send each batch of radio data.
 #define RADIO_REPEATS 1
 
 
 
-// COLORS //
+// COLORS // (max of 200 becuase it looks nicer)
 static const uint8_t WHITE[3] = {200, 200, 200};
 static const uint8_t GREEN[3] = {0, 200, 0};      // IO messages
 static const uint8_t PURPLE[3] = {160, 0, 160};   // GPS messages
@@ -87,8 +91,9 @@ uint8_t trgb[3];
 uint8_t frgb[3];
 bool br = false;
 
-uint8_t camc = 0;
-uint8_t cycles = 0;
+uint8_t camcycles = 0;
+uint8_t radiocycles = 0;
+uint8_t sdcycles = 0;
 bool fatalerr = false;
 bool ready = false;
 
@@ -144,14 +149,46 @@ void setup() {
   }
 
   // init SD
-  if(!sd.begin(SD_CONFIG)) {
-    logln("Failed to init SD Card SPI!");
-    if(DEBUG) sd.initErrorPrint(&Serial);
-    fatalerr = true;
-    breathe(GREEN, RED);
-    return;
-  } else {
-    logln("SD OK");
+  if(USE_SD) {
+    if(!sd.begin(SD_CONFIG)) {
+      logln("Failed to init SD Card SPI!");
+      if(DEBUG) sd.initErrorPrint(&Serial);
+      fatalerr = true;
+      breathe(GREEN, RED);
+      return;
+    } else {
+      // simple check for SD r/w capabilities. deletes the file, create one, write some text, close it. Open it again, read it back, then close and check if they are the same.
+      sd.remove("check.txt");
+      if(!file.open("check.txt", O_WRONLY | O_CREAT)) {
+        logln("Failed to create check file!");
+        fatalerr = true;
+      } else {
+        file.print("200 OK");
+        if(!file.close()) {
+          logln("Check file didn't close!");
+          fatalerr = true;
+        }
+        if(!file.open("check.txt")) {
+          logln("Failed to open check file!");
+          fatalerr = true;
+        }
+        if(file.readString() != "200 OK") {
+          logln("File check was not OK!");
+          fatalerr = true;
+        }
+        if(!file.close()) {
+          logln("Check file didn't close!");
+          fatalerr = true;
+        }
+        sd.remove("check.txt");
+        if(fatalerr) {
+          breathe(GREEN, RED);
+          logln("SD failed check!");
+          return;
+        }
+      }
+      logln("SD OK");
+    }
   }
 
   /* init camera
@@ -207,7 +244,7 @@ void setup() {
   state = 1;
   logln("initialized successfully");
   digitalWrite(LED_BUILTIN, HIGH);
-  if(WAIT_FOR_TIME) breathe(OFF, PURPLE);
+  if(WAIT_FOR_GPS) breathe(OFF, PURPLE);
   else ready = true;
 }
 
@@ -221,7 +258,7 @@ void loop() {
   }
   if(!ready && timeValid()) {
     logln("Got time, ready!");
-    incFileSafe();
+    if(USE_SD) incFileSafe();
     state = 200;
     ready = true;
     toColor(OFF);
@@ -233,10 +270,6 @@ void loop() {
     await(2000);
     return;
   }
-  if(cycles == CYCLES_PER_FILE) {
-    incFileSafe();
-    cycles = 0;
-  }
 
   pressure = pres.readPressure();
   temperature = temp.readTempC();
@@ -245,29 +278,57 @@ void loop() {
     altitude = gps.altitude.meters();
   } else altitude = 0;
   if(gps.charsProcessed() != 0) state = 201;
-  ++camc;
-  if(camc > CAMERA_SAMPLE_CYCLE_SKIP) {
-    camc = 0;
-    //take_picture();
+  if(USE_CAMERA) {
+    ++camcycles;
+    if(camcycles > CYCLES_PER_PIC) {
+      camcycles = 0;
+      //take_picture();
+    }
   }
 
-  writeData();
+  if(USE_SD) {
+    ++sdcycles;
+    if(sdcycles == CYCLES_PER_FILE) {
+      incFileSafe();
+      sdcycles = 0;
+    }
+    writeData();
+  }
+
+  if(USE_RADIO) {
+    ++radiocycles;
+    if(radiocycles > CYCLES_PER_RX) {
+      sendRadio();
+    }
+  }
 
   if(DEBUG) {
     logln("State\tTime\t\tAlt.\tSpeed\t\tLat\t\tLong\t\tPressure\tTemperature\tInternal Temp\tSatellites");
     char cz[128];
     // tasty
-    sprintf(cz, "%i\t%02i:%02i:%02i\t%.4fm\t%.4fm/s\t%.6f\t%.6f\t%.4fhPa\t%.4fc\t%.4fc\t%i", state, gps.time.hour(), gps.time.minute(), gps.time.second(), altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp, gps.satellites.value());
+    snprintf(cz, 128, "%i\t%02i:%02i:%02i\t%.4fm\t%.4fm/s\t%.6f\t%.6f\t%.4fhPa\t%.4fc\t%.4fc\t%i", state, gps.time.hour(), gps.time.minute(), gps.time.second(), altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp, gps.satellites.value());
     logln(cz);
   }
 
 
-  ++cycles;
-  // wait the remaining time.
-  await(SENSOR_SAMPLE_WAIT - (millis() - now));
+  // wait the remaining time. Use this to prevent a possible negative number in ulong if it takes longer than CYCLE_MILLIHERTZ.
+  long dur = millis() - now;
+  if(dur < 0) {
+    char c[32];
+    snprintf(c, 32, "Running %i millis behind!", -dur);
+    logln(c);
+    return;
+  }
+  else await(CYCLE_MILLIHERTZ - dur);
 }
 
+// delay which still polls the GPS and updates the LED.
+// if the GPS and LED is disabled, this will use pico low power sleep mode.
 void await(unsigned long ms) {
+  if(!USE_GPS && !USE_LED) {
+    sleep_ms(ms);
+    return;
+  }
   unsigned long now = millis();
   uint32_t cycl = 0;
   do 
@@ -279,7 +340,7 @@ void await(unsigned long ms) {
         cycl = 0;
       }
     }
-    if(USE_GPS) feedGPS();
+    if(!fatalerr && USE_GPS) feedGPS();
   } while (millis() - now < ms);
 }
 
@@ -298,6 +359,7 @@ bool incFile() {
     logln(".");
 
     if(file.isOpen()) {
+      // fix for busy retries
       await(50);
       if(file.isBusy()) {
         logln("File busy? waiting 50ms");
@@ -314,10 +376,10 @@ bool incFile() {
       await(50);
     }
     char cz[32];
-    sprintf(cz, "log_%02i-%02i-%02i.csv", gps.time.hour(), gps.time.minute(), gps.time.second());
+    snprintf(cz, 32, "log_%02i-%02i-%02i.csv", gps.time.hour(), gps.time.minute(), gps.time.second());
     if(sd.exists(cz)) { 
-      logln("File already exists?! appending random number and hoping for the best.");
-      sprintf(cz, "%s(%i).csv", cz, rand() % 1000);
+      logln("File already exists? Using time since startup");
+      snprintf(cz, 32, "log_%010i.csv", millis());
     }
     if(!file.open(cz, O_WRONLY | O_CREAT)) {
       logln("Failed to open file, waiting 50ms");
@@ -327,15 +389,15 @@ bool incFile() {
     }
 
     // add csv header
-    file.println("state, time, alt, speed, latitude, longitude,pressure, temperature, internaltemperature");
+    file.println("state, time, alt, speed, latitude, longitude, pressure, temperature, internaltemperature");
     log("File "); log(cz); logln(" opened. OK");
     return true;
   }
-  logln("Ran out of tries! This is bad!");
+  logln("SD IO error! ran out of tries!");
   return false;
 }
 
-bool incFileSafe() {
+inline bool incFileSafe() {
   if(!incFile()) {
     logln("FATAL: File increment fail!");
     fatalerr = true;
@@ -358,8 +420,30 @@ void writeData() {
   }
   // plenty of space to avoid overflows
   char cz[128];
-  sprintf(cz, "%i, %02i:%02i:%02i, %.8f, %.8f, %.8f, %.8f, %.8f, %.8f, %.8f", state, gps.time.hour(), gps.time.minute(), gps.time.second(), altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp);
+  snprintf(cz, 128, "%i, %02i:%02i:%02i, %.8f, %.8f, %.8f, %.8f, %.8f, %.8f, %.8f", state, gps.time.hour(), gps.time.minute(), gps.time.second(), altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp);
   file.println(cz);
+}
+
+
+
+
+
+
+
+// RADIO //
+
+// send data on the radio RADIO_REPEATS times. Packets start with a ? and end with a !
+void sendRadio() {
+  logln("Sending packet on radio...");
+  uint8_t i = 0;
+  while(i<=RADIO_REPEATS) {
+    //lora.beginPacket();
+    char cz[72];
+    snprintf(cz, 72, "?%05X;%.8f;%.8f;%.8f;%.8f;%.8f;%.8f;%.8f!", state, altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp);
+    //lora.print(cz);
+    //lora.endPacket();
+  }
+  logln("Packet(s) sent");
 }
 
 
