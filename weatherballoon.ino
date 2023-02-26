@@ -39,6 +39,7 @@
 // weather the system should wait for the GPS to have a time before starting.
 #define WAIT_FOR_TIME true
 
+// TODO use SHARED_SPI mode when radio is added
 #define SD_CONFIG SdSpiConfig(IO_SD, DEDICATED_SPI, SD_SCK_MHZ(16))
 
 // sample delay for the sensors.
