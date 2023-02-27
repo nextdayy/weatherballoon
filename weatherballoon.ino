@@ -4,6 +4,7 @@
 #include "SoftwareSerial.h"
 #include "SdFat.h"
 #include "sdios.h"
+#include "LoRa.h"
 
 // PINS //
 #define IO_MISO D12   //
@@ -11,6 +12,9 @@
 #define IO_SCK D10    // 
 #define IO_SD SDCARD_SS_PIN // see %localappdata%\Arduino15\packages\rp2040\hardware\rp2040\2.7.3\libraries\ESP8266SdFat\src\SdFatConfig.h
 #define IO_RADIO D13
+
+#define RADIO_DIO0 D14
+#define RADIO_RST D15
 
 #define CAM_CS D17
 #define CAM_MISO D16 //
@@ -35,13 +39,11 @@
 #define USE_GPS true
 #define USE_I2C true
 #define USE_CAMERA false
-#define USE_RADIO false
+#define USE_RADIO true
 #define USE_SD true
 // weather the system should wait for the GPS to have a time before starting.
-#define WAIT_FOR_GPS true
+#define WAIT_FOR_GPS false
 
-
-#define SD_CONFIG SdSpiConfig(IO_SD, SHARED_SPI, SD_SCK_MHZ(16))
 
 // cycle hertz for the system. Basically its clock. Every time this is reached, a sensor sample is taken, and the various cycle counters for the below are incremented.
 #define CYCLE_MILLIHERTZ 2000
@@ -58,8 +60,6 @@
 #define MAX_SD_TRIES 5
 // amount of times to send each batch of radio data.
 #define RADIO_REPEATS 1
-
-
 
 // COLORS // (max of 200 becuase it looks nicer)
 static const uint8_t WHITE[3] = {200, 200, 200};
@@ -124,13 +124,14 @@ void setup() {
     pinMode(LED_G, OUTPUT_2MA);
     pinMode(LED_B, OUTPUT_2MA);
   }
+  analogReadResolution(12);
   
 
   // init CS pins
   pinMode(IO_SD, OUTPUT);
   pinMode(IO_RADIO, OUTPUT);
   pinMode(CAM_CS, OUTPUT);
-
+  
 
   // init I2C + SPI
   SPI1.setRX(IO_MISO);
@@ -150,7 +151,7 @@ void setup() {
 
   // init SD
   if(USE_SD) {
-    if(!sd.begin(SD_CONFIG)) {
+    if(!sd.begin(SdSpiConfig(IO_SD, SHARED_SPI, SD_SCK_MHZ(10)))) {
       logln("Failed to init SD Card SPI!");
       if(DEBUG) sd.initErrorPrint(&Serial);
       fatalerr = true;
@@ -189,6 +190,22 @@ void setup() {
       }
       logln("SD OK");
     }
+  }
+
+  if(USE_RADIO) {
+    digitalWrite(IO_SD, HIGH);
+    digitalWrite(IO_RADIO, LOW);
+    LoRa.setPins(IO_RADIO, RADIO_RST, RADIO_DIO0);
+    LoRa.setSPI(SPI1);
+    if(!LoRa.begin(868E6)) {
+      logln("LoRa failed to start!");
+      fatalerr = true;
+    } else {
+      logln("Radio OK");
+    }
+    LoRa.sleep();
+    digitalWrite(IO_RADIO, HIGH);
+    digitalWrite(IO_SD, LOW);
   }
 
   /* init camera
@@ -271,6 +288,8 @@ void loop() {
     return;
   }
 
+  // TODO
+  logln(((analogRead(A3) * 3.3) / 65535) * 3);
   pressure = pres.readPressure();
   temperature = temp.readTempC();
   internal_temp = pres.readTemperature();
@@ -299,6 +318,7 @@ void loop() {
     ++radiocycles;
     if(radiocycles > CYCLES_PER_RX) {
       sendRadio();
+      radiocycles = 0;
     }
   }
 
@@ -434,16 +454,22 @@ void writeData() {
 
 // send data on the radio RADIO_REPEATS times. Packets start with a ? and end with a !
 void sendRadio() {
-  logln("Sending packet on radio...");
+  digitalWrite(IO_SD, HIGH);
+  digitalWrite(IO_RADIO, LOW);
+  logln("Sending data on radio...");
   uint8_t i = 0;
-  while(i<=RADIO_REPEATS) {
-    //lora.beginPacket();
-    char cz[72];
-    snprintf(cz, 72, "?%05X;%.8f;%.8f;%.8f;%.8f;%.8f;%.8f;%.8f!", state, altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp);
-    //lora.print(cz);
-    //lora.endPacket();
+  while(i<RADIO_REPEATS) {
+    LoRa.beginPacket();
+    char cz[128];
+    snprintf(cz, 128, "?%05i;%.8f;%.8f;%.8f;%.8f;%.8f;%.8f;%.8f!", state, altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp);
+    LoRa.print(cz);
+    LoRa.endPacket();
+    i++;
   }
   logln("Packet(s) sent");
+  LoRa.sleep();
+  digitalWrite(IO_RADIO, HIGH);
+  digitalWrite(IO_SD, LOW);
 }
 
 
@@ -594,6 +620,14 @@ inline void logln(String s) {
   if(DEBUG) Serial.println(s);
 }
 
+inline void logln(double num) {
+  if(DEBUG) Serial.println(num);
+}
+
+inline void logln(int num) {
+  if(DEBUG) Serial.println(num);
+}
+
 inline void log(const char c[]) {
   if(DEBUG) Serial.print(c);
 }
@@ -601,6 +635,7 @@ inline void log(const char c[]) {
 inline void log(String s) {
   if(DEBUG) Serial.print(s);
 }
+
 inline void logi(int num) {
   if(DEBUG) Serial.print(num);
 }
