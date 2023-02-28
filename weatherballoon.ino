@@ -16,15 +16,15 @@
 #define RADIO_DIO0 D14
 #define RADIO_RST D15
 
-#define CAM_CS D17
-#define CAM_MISO D16 //
-#define CAM_MOSI D19 // aka SPI0
-#define CAM_SCK D18  //
-#define CAM_SDA D20  //
-#define CAM_SCL D21  // aka I2C0
+//#define CAM_CS D17
+//#define CAM_MISO D16 //
+//#define CAM_MOSI D19 // aka SPI0
+//#define CAM_SCK D18  //
+//#define CAM_SDA D20  //
+//#define CAM_SCL D21  // aka I2C0
 
-#define I2C_SDA D2  //
-#define I2C_SCL D3  // aka I2C1
+#define I2C_SDA D6  //
+#define I2C_SCL D7  // aka I2C1
 
 #define GPS_TX D0   //
 #define GPS_RX D1   // aka UART0
@@ -130,7 +130,7 @@ void setup() {
   // init CS pins
   pinMode(IO_SD, OUTPUT);
   pinMode(IO_RADIO, OUTPUT);
-  pinMode(CAM_CS, OUTPUT);
+  //pinMode(CAM_CS, OUTPUT);
   
 
   // init I2C + SPI

@@ -1,0 +1,25 @@
+physical pin num, pin name, digital pin number
+39 BATT_POSITIVE // vsys
+38 GND // this can be also connected to battery (common ground)
+
+16 IO_MISO D12   // SO on SD
+15 IO_MOSI D11   // SI on SD
+14 IO_SCK D10    // (aka SPI1)
+
+12 IO_SD D9      // CS
+17 IO_RADIO D13  // CS
+
+19 RADIO_DIO0 D14 // G0 on radio
+20 RADIO_RST D15  // RST on radio
+// note EN is blank !
+
+09 I2C_SDA D6  //
+10 I2C_SCL D7  // (aka I2C1)
+
+01 GPS_TX D0   // RXD on gps !
+02 GPS_RX D1   // TXD on gps !
+
+34 LED_R D28
+// led ground (longest)
+32 LED_G D27
+31 LED_B D26
