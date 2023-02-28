@@ -151,6 +151,8 @@ void setup() {
 
   // init SD
   if(USE_SD) {
+    digitalWrite(IO_RADIO, HIGH);
+    digitalWrite(IO_SD, LOW);
     if(!sd.begin(SdSpiConfig(IO_SD, SHARED_SPI, SD_SCK_MHZ(10)))) {
       logln("Failed to init SD Card SPI!");
       if(DEBUG) sd.initErrorPrint(&Serial);
@@ -190,6 +192,7 @@ void setup() {
       }
       logln("SD OK");
     }
+    digitalWrite(IO_RADIO, HIGH);
   }
 
   if(USE_RADIO) {
