@@ -41,8 +41,10 @@
 #define USE_CAMERA false
 #define USE_RADIO true
 #define USE_SD true
-// weather the system should wait for the GPS to have a time before starting.
+// weather the system should wait for the GPS to have a data before starting.
 #define WAIT_FOR_GPS false
+// set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
+#define WATCHDOG 8000
 
 
 // cycle hertz for the system. Basically its clock. Every time this is reached, a sensor sample is taken, and the various cycle counters for the below are incremented.
@@ -107,16 +109,22 @@ uint16_t state = 0;
 
 
 void setup() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  // turn off onboard LED until init done.
-  digitalWrite(LED_BUILTIN, LOW);
+  pinMode(LED_BUILTIN, OUTPUT_2MA);
+  digitalWrite(LED_BUILTIN, HIGH);
 
   if(DEBUG) {
     Serial.begin(115200);
     // wait for serial init...
     while (!Serial) ;
-    Serial.println("Init begin...");
+    Serial.print("Init begin... Running at ");
+    Serial.print(rp2040.f_cpu() / 1000000);
+    Serial.print("MHz. ");
   }
+
+  if(WATCHDOG > 0) {
+    Serial.println("Watchdog enabled!");
+    rp2040.wdt_begin(WATCHDOG);
+  } else Serial.println();
 
   // init LED
   if(USE_LED) {
@@ -124,7 +132,6 @@ void setup() {
     pinMode(LED_G, OUTPUT_2MA);
     pinMode(LED_B, OUTPUT_2MA);
   }
-  analogReadResolution(12);
   
 
   // init CS pins
@@ -134,6 +141,7 @@ void setup() {
   
 
   // init I2C + SPI
+  analogReadResolution(12);
   SPI1.setRX(IO_MISO);
   SPI1.setTX(IO_MOSI);
   SPI1.setSCK(IO_SCK);
@@ -148,6 +156,7 @@ void setup() {
     gpsSS.begin(9600);
     logln("GPS OK");
   }
+  wdt();
 
   // init SD
   if(USE_SD) {
@@ -194,6 +203,7 @@ void setup() {
     }
     digitalWrite(IO_RADIO, HIGH);
   }
+  wdt();
 
   if(USE_RADIO) {
     digitalWrite(IO_SD, HIGH);
@@ -210,6 +220,7 @@ void setup() {
     digitalWrite(IO_RADIO, HIGH);
     digitalWrite(IO_SD, LOW);
   }
+  wdt();
 
   /* init camera
   if(USE_CAMERA) {
@@ -237,6 +248,7 @@ void setup() {
     delay(500);
     take_picture();
   }*/
+  wdt();
 
   // init i2c devices
   if(USE_I2C) {
@@ -260,36 +272,40 @@ void setup() {
       logln("Pressure Sensor OK");
     }
   }
+  wdt();
 
   state = 1;
   logln("initialized successfully");
-  digitalWrite(LED_BUILTIN, HIGH);
   if(WAIT_FOR_GPS) breathe(OFF, PURPLE);
   else ready = true;
+  digitalWrite(LED_BUILTIN, LOW);
+  wdt();
 }
 
 
 void loop() {
   unsigned long now = millis();
   if(fatalerr) {
+    state = 500;
     logln("Fatal error! Please restart.");
     await(5000);
     return;
   }
-  if(!ready && timeValid()) {
-    logln("Got time, ready!");
-    if(USE_SD) incFileSafe();
-    state = 200;
+  wdt();
+  digitalWrite(LED_BUILTIN, HIGH);
+  if(!ready && gpsReady()) {
+    logln("GPS ready, ready!");
     ready = true;
     toColor(OFF);
   }
   if(!ready) {
-    log("Waiting for GPS time... (c=");
+    log("Waiting for GPS... (c=");
     logi(gps.charsProcessed()); log("; s=");
     logi(gps.satellites.value()); logln(")");
+    if(gps.charsProcessed() != 0) state = 101;
     await(2000);
     return;
-  }
+  } else state = 200;
 
   // TODO
   logln(((analogRead(A3) * 3.3) / 65535) * 3);
@@ -299,7 +315,6 @@ void loop() {
   if(gps.altitude.isValid()) {
     altitude = gps.altitude.meters();
   } else altitude = 0;
-  if(gps.charsProcessed() != 0) state = 201;
   if(USE_CAMERA) {
     ++camcycles;
     if(camcycles > CYCLES_PER_PIC) {
@@ -307,6 +322,7 @@ void loop() {
       //take_picture();
     }
   }
+  wdt();
 
   if(USE_SD) {
     ++sdcycles;
@@ -316,6 +332,7 @@ void loop() {
     }
     writeData();
   }
+  wdt();
 
   if(USE_RADIO) {
     ++radiocycles;
@@ -324,6 +341,7 @@ void loop() {
       radiocycles = 0;
     }
   }
+  wdt();
 
   if(DEBUG) {
     logln("State\tTime\t\tAlt.\tSpeed\t\tLat\t\tLong\t\tPressure\tTemperature\tInternal Temp\tSatellites");
@@ -348,6 +366,8 @@ void loop() {
 // delay which still polls the GPS and updates the LED.
 // if the GPS and LED is disabled, this will use pico low power sleep mode.
 void await(unsigned long ms) {
+  wdt();
+  digitalWrite(LED_BUILTIN, LOW);
   if(!USE_GPS && !USE_LED) {
     sleep_ms(ms);
     return;
@@ -356,6 +376,7 @@ void await(unsigned long ms) {
   uint32_t cycl = 0;
   do 
   {
+    wdt();
     if(USE_LED) {
       ++cycl;
       if(cycl > COLOR_UPD_SKIP) {
@@ -606,6 +627,10 @@ inline bool timeValid() {
   return gps.time.isValid() && !(gps.time.hour() == 0 && gps.time.minute() == 0 && gps.time.second() == 0);
 }
 
+inline bool gpsReady() {
+  return timeValid && !(gps.location.lat() == 0 && gps.location.lng() == 0 && gps.altitude.meters() == 0);
+}
+
 
 
 
@@ -641,6 +666,11 @@ inline void log(String s) {
 
 inline void logi(int num) {
   if(DEBUG) Serial.print(num);
+}
+
+// poll the watchdog
+inline void wdt() {
+  if(WATCHDOG > 0) rp2040.wdt_reset();
 }
 
 
