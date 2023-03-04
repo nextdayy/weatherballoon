@@ -52,6 +52,7 @@
 // weather the system should wait for USB in order to begin running when DEBUG is true.
 #define WAIT_FOR_DEBUG false
 // set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
+// note that images can take a VERY long time on lower clock speeds (5 seconds), so make sure to include plenty of time around that to avoid accidental resets.
 #define WATCHDOG 8000
 
 
@@ -60,7 +61,7 @@
 // how many samples should be written to one file before swapping to next one.
 #define CYCLES_PER_FILE 35
 // how many sensor cycles to skip before taking a picture (e.g. 3xSENSOR_SAMPLE_WAIT of 5000 = every 15s)
-#define CYCLES_PER_PIC 10
+#define CYCLES_PER_PIC 30
 // how many sensor cycles to skip before sending radio (same as above)
 #define CYCLES_PER_RX 5
 
@@ -268,13 +269,15 @@ void setup() {
       breathe(YELLOW, RED);
     }
     else logln("Camera OK");
-    camera.set_format(JPEG);
-    camera.OV5642_set_JPEG_size(OV5642_1600x1200);
     delay(100);
+    camera.set_format(JPEG);
     camera.InitCAM();
     camera.set_bit(ARDUCHIP_TIM, VSYNC_LEVEL_MASK);
+    camera.OV5642_set_JPEG_size(OV5642_1280x960);
     camera.clear_fifo_flag();   
     camera.write_reg(ARDUCHIP_FRAMES, 0x00);
+    delay(100);
+    cameraSleep();
   }
   wdt();
 
@@ -380,12 +383,12 @@ void loop() {
   }
 
 
-  // wait the remaining time. Use this to prevent a possible negative number in ulong if it takes longer than CYCLE_MILLIHERTZ.#
+  // wait the remaining time. Use this to prevent a possible negative number in ulong if it takes longer than CYCLE_MILLIHERTZ.
   digitalWrite(LED_BUILTIN, LOW);
   long dur = millis() - now;
-  if(dur < 0) {
-    char c[32];
-    snprintf(c, 32, "Running %i millis behind!", -dur);
+  if(dur > CYCLE_MILLIHERTZ) {
+    char c[48];
+    snprintf(c, 48, "Running %010i millis behind!", dur);
     logln(c);
     return;
   }
@@ -531,23 +534,28 @@ void sendRadio() {
 
 // close the log file, open a picture file and write out the data, then re-open the log.
 bool take_picture() {
+  cameraWake();
+  delay(50);
   camera.flush_fifo();
   camera.clear_fifo_flag();
   //Start capture
   camera.start_capture();
-  while (!camera.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK))
-  {
-    logln("Camera took picture successfully");
-    wdt();
-    if(!read_fifo_burst(camera)) {
-      logln("Camera picture failed!");
-      fatalerr = true;
-      breathe(YELLOW, RED);
-      return false;
-    }
-    //Clear the capture done flag
-    camera.clear_fifo_flag();
+  wdt();
+  while (!camera.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) ;
+  
+  logln("Camera took picture successfully");
+  wdt();
+  if(!read_fifo_burst(camera)) {
+    logln("Camera picture failed!");
+    fatalerr = true;
+    breathe(YELLOW, RED);
+    return false;
   }
+  //Clear the capture done flag
+  camera.clear_fifo_flag();
+  delay(50);
+  cameraSleep();
+  wdt();
   return true;
 }
 
@@ -558,6 +566,7 @@ bool read_fifo_burst(ArduCAM myCAM) {
   char oldName[32];
   file.getName(oldName, 32);
   while(tries < MAX_SD_TRIES) {
+    wdt();
     if(!file.close()) {
       logln("Failed to close log file, waiting 50ms");
       await(50);
@@ -605,7 +614,6 @@ bool read_fifo_burst(ArduCAM myCAM) {
       else if ((temp == 0xD8) & (temp_last == 0xFF))
       {
         is_header = true;
-        logln("Image successfully taken");
         file.write(temp_last);
         file.write(temp);
       }
@@ -631,9 +639,25 @@ bool read_fifo_burst(ArduCAM myCAM) {
       ++tries;
       continue;
     }
+    logln("Image successfully taken");
+    wdt();
+    return true;
   }
   return true;
 }
+
+inline void cameraSleep() {
+  camera.set_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK); 
+}
+
+inline void cameraWake() {
+  camera.clear_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK); 
+}
+
+
+
+
+
 
 
 
