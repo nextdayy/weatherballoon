@@ -5,23 +5,29 @@
 #include "SdFat.h"
 #include "sdios.h"
 #include "LoRa.h"
+#include "ArduCAM.h"
 
 // PINS //
 #define IO_MISO D12   //
 #define IO_MOSI D11   // aka SPI1
 #define IO_SCK D10    // 
-#define IO_SD SDCARD_SS_PIN // see %localappdata%\Arduino15\packages\rp2040\hardware\rp2040\2.7.3\libraries\ESP8266SdFat\src\SdFatConfig.h
+#define IO_SD SDCARD_SS_PIN // see %localappdata%\Arduino15\packages\rp2040\hardware\rp2040\3.0.0\libraries\ESP8266SdFat\src\SdFatConfig.h and add these pins to there at the top, like:
+// #define SDCARD_SPI      SPI1
+// #define SDCARD_MISO_PIN D12
+// #define SDCARD_MOSI_PIN D11
+// #define SDCARD_SCK_PIN  D10
+// #define SDCARD_SS_PIN   D9
 #define IO_RADIO D13
 
 #define RADIO_DIO0 D14
 #define RADIO_RST D15
 
-//#define CAM_CS D17
-//#define CAM_MISO D16 //
-//#define CAM_MOSI D19 // aka SPI0
-//#define CAM_SCK D18  //
-//#define CAM_SDA D20  //
-//#define CAM_SCL D21  // aka I2C0
+#define CAM_CS D17
+#define CAM_MISO D16 //
+#define CAM_MOSI D19 // aka SPI0
+#define CAM_SCK D18  //
+#define CAM_SDA D20  //
+#define CAM_SCL D21  // aka I2C0
 
 #define I2C_SDA D6  //
 #define I2C_SCL D7  // aka I2C1
@@ -38,11 +44,13 @@
 #define USE_LED true
 #define USE_GPS true
 #define USE_I2C true
-#define USE_CAMERA false
+#define USE_CAMERA true
 #define USE_RADIO true
 #define USE_SD true
 // weather the system should wait for the GPS to have a data before starting.
-#define WAIT_FOR_GPS false
+#define WAIT_FOR_GPS true
+// weather the system should wait for USB in order to begin running when DEBUG is true.
+#define WAIT_FOR_DEBUG false
 // set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
 #define WATCHDOG 8000
 
@@ -67,7 +75,7 @@
 static const uint8_t WHITE[3] = {200, 200, 200};
 static const uint8_t GREEN[3] = {0, 200, 0};      // IO messages
 static const uint8_t PURPLE[3] = {160, 0, 160};   // GPS messages
-static const uint8_t YELLOW[3] = {200, 200, 0};   // I2C messages
+static const uint8_t YELLOW[3] = {200, 200, 0};   // camera messages
 static const uint8_t RED[3] = {200, 0, 0};
 static const uint8_t OFF[3] = {0, 0, 0};
 
@@ -86,6 +94,9 @@ SoftwareSerial gpsSS(GPS_RX, GPS_TX);
 SdFat32 sd;
 // currently open file
 File32 file;
+
+// camera object
+ArduCAM camera(OV5642, CAM_CS);
 
 // color data
 uint8_t rgb[3];
@@ -115,16 +126,16 @@ void setup() {
   if(DEBUG) {
     Serial.begin(115200);
     // wait for serial init...
-    while (!Serial) ;
+    if(WAIT_FOR_DEBUG) while (!Serial) ;
     Serial.print("Init begin... Running at ");
     Serial.print(rp2040.f_cpu() / 1000000);
     Serial.print("MHz. ");
   }
 
   if(WATCHDOG > 0) {
-    Serial.println("Watchdog enabled!");
+    logln("Watchdog enabled!");
     rp2040.wdt_begin(WATCHDOG);
-  } else Serial.println();
+  } else logln("");
 
   // init LED
   if(USE_LED) {
@@ -142,9 +153,16 @@ void setup() {
 
   // init I2C + SPI
   analogReadResolution(12);
+  SPI.setTX(CAM_MOSI);
+  SPI.setRX(CAM_MISO);
+  SPI.setSCK(CAM_SCK);
+  SPI.begin();
   SPI1.setRX(IO_MISO);
   SPI1.setTX(IO_MOSI);
   SPI1.setSCK(IO_SCK);
+  Wire.setSCL(CAM_SCL);
+  Wire.setSDA(CAM_SDA);
+  Wire.begin();
   Wire1.setSDA(I2C_SDA);
   Wire1.setSCL(I2C_SCL);
   Wire1.begin();
@@ -222,18 +240,21 @@ void setup() {
   }
   wdt();
 
-  /* init camera
+  // init camera
   if(USE_CAMERA) {
     uint8_t vid,pid;
     uint8_t state;
-    camera.CS_HIGH();
-    camera.ioInit(CAM_SDA, CAM_SCL, CAM_MISO, CAM_MOSI, CAM_SCK);
-    delay(500);
+    camera.write_reg(0x07, 0x80);
+    delay(100);
+    camera.write_reg(0x07, 0x00);
+    delay(100);
     // Check if the ArduCAM SPI bus is OK
     camera.write_reg(ARDUCHIP_TEST1, 0x55);
     state = camera.read_reg(ARDUCHIP_TEST1);
     if(state != 0x55) {
         logln("Camera SPI interface error!");
+        fatalerr = true;
+        breathe(YELLOW, RED);
         return;
     }  
     // Change MCU mode
@@ -241,13 +262,20 @@ void setup() {
     camera.wrSensorReg16_8(0xff, 0x01);
     camera.rdSensorReg16_8(OV5642_CHIPID_HIGH, &vid);
     camera.rdSensorReg16_8(OV5642_CHIPID_LOW, &pid);
-    if((vid != 0x56) || (pid != 0x42)) logln("Can't find camera module!");
+    if((vid != 0x56) || (pid != 0x42)) {
+      logln("Can't find camera module?!");
+      fatalerr = true;
+      breathe(YELLOW, RED);
+    }
     else logln("Camera OK");
+    camera.set_format(JPEG);
+    camera.OV5642_set_JPEG_size(OV5642_1600x1200);
+    delay(100);
     camera.InitCAM();
-    camera.write_reg(ARDUCHIP_TIM, VSYNC_LEVEL_MASK);		//VSYNC is active HIGH   	  
-    delay(500);
-    take_picture();
-  }*/
+    camera.set_bit(ARDUCHIP_TIM, VSYNC_LEVEL_MASK);
+    camera.clear_fifo_flag();   
+    camera.write_reg(ARDUCHIP_FRAMES, 0x00);
+  }
   wdt();
 
   // init i2c devices
@@ -292,7 +320,6 @@ void loop() {
     return;
   }
   wdt();
-  digitalWrite(LED_BUILTIN, HIGH);
   if(!ready && gpsReady()) {
     logln("GPS ready, ready!");
     ready = true;
@@ -307,6 +334,7 @@ void loop() {
     return;
   } else state = 200;
 
+  digitalWrite(LED_BUILTIN, HIGH);
   // TODO
   logln(((analogRead(A3) * 3.3) / 65535) * 3);
   pressure = pres.readPressure();
@@ -318,8 +346,8 @@ void loop() {
   if(USE_CAMERA) {
     ++camcycles;
     if(camcycles > CYCLES_PER_PIC) {
+      take_picture();
       camcycles = 0;
-      //take_picture();
     }
   }
   wdt();
@@ -352,7 +380,8 @@ void loop() {
   }
 
 
-  // wait the remaining time. Use this to prevent a possible negative number in ulong if it takes longer than CYCLE_MILLIHERTZ.
+  // wait the remaining time. Use this to prevent a possible negative number in ulong if it takes longer than CYCLE_MILLIHERTZ.#
+  digitalWrite(LED_BUILTIN, LOW);
   long dur = millis() - now;
   if(dur < 0) {
     char c[32];
@@ -367,7 +396,6 @@ void loop() {
 // if the GPS and LED is disabled, this will use pico low power sleep mode.
 void await(unsigned long ms) {
   wdt();
-  digitalWrite(LED_BUILTIN, LOW);
   if(!USE_GPS && !USE_LED) {
     sleep_ms(ms);
     return;
@@ -500,105 +528,112 @@ void sendRadio() {
 
 
 // CAMERA // 
-/*
-void take_picture() {
-  // Flush the FIFO
-  camera.flush_fifo();    
-  // Clear the capture done flag
-  camera.clear_fifo_flag();
-  camera.set_format(JPEG);
-  camera.OV5642_set_JPEG_size(OV5642_320x240);
-  // Start capture
-  logln("Start capture\n");  
-  camera.start_capture();
-  while (!(camera.read_reg(ARDUCHIP_TRIG) & CAP_DONE_MASK)){}
-  logln("CAM Capture Done\n");
-  read_fifo_burst();
-  camera.clear_fifo_flag();
+
+// close the log file, open a picture file and write out the data, then re-open the log.
+bool take_picture() {
   camera.flush_fifo();
+  camera.clear_fifo_flag();
+  //Start capture
+  camera.start_capture();
+  while (!camera.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK))
+  {
+    logln("Camera took picture successfully");
+    wdt();
+    if(!read_fifo_burst(camera)) {
+      logln("Camera picture failed!");
+      fatalerr = true;
+      breathe(YELLOW, RED);
+      return false;
+    }
+    //Clear the capture done flag
+    camera.clear_fifo_flag();
+  }
+  return true;
 }
 
-uint8_t read_fifo_burst()
-{
-  uint8_t temp = 0, temp_last = 0;
-  uint32_t length = 0;
+// read the data and actually do the file opening/closing/writing.
+bool read_fifo_burst(ArduCAM myCAM) {
+  uint8_t tries = 0;
   bool is_header = false;
-  static int i = 0;
-  static int k = 0;
-  char str[8];
-  //File outFile;
-  byte buf[256];
-  length = camera.read_fifo_length();
-  Serial.print(F("The fifo length is :"));
-  Serial.println(length, DEC);
-  if (length >= MAX_FIFO_SIZE) //8M
-  {
-    logln("Over size.");
-    return 0;
-  }
-  if (length == 0 ) //0 kb
-  {
-    log(F("Size is 0."));
-    return 0;
-  }
-  camera.set_fifo_burst();//Set fifo burst mode
-  i = 0;
-  while ( length-- )
-  {
-    temp_last = temp;
-    temp =  SPI.transfer(0x00);
-    //Read JPEG data from FIFO
-    if ( (temp == 0xD9) && (temp_last == 0xFF) ) //If find the end ,break while,
-    {
-      buf[i++] = temp;  //save the last  0XD9
-      //Write the remain bytes in the buffer
-      camera.CS_HIGH();
-      Serial.write(buf, i);
-      //Close the file
-      //outFile.close();
-      log(F("OK"));
-      is_header = false;
-      camera.set_fifo_burst();
-      i = 0;
+  char oldName[32];
+  file.getName(oldName, 32);
+  while(tries < MAX_SD_TRIES) {
+    if(!file.close()) {
+      logln("Failed to close log file, waiting 50ms");
+      await(50);
+      ++tries;
+      continue;
     }
-    if (is_header == true)
+    await(50);
+    char cz[32];
+    snprintf(cz, 32, "pic_%02i-%02i-%02i.jpg", gps.time.hour(), gps.time.minute(), gps.time.second());
+    if(sd.exists(cz)) { 
+      logln("picture file already exists? Using time since startup");
+      snprintf(cz, 32, "pic_%010i.jpg", millis());
+    }
+    if(!file.open(cz, O_WRONLY | O_CREAT)) {
+      logln("Failed to open picture file, waiting 50ms");
+      await(50);
+      ++tries;
+      continue;
+    }
+    wdt();
+
+    uint8_t temp = 0, temp_last = 0;
+    uint32_t length = 0; 
+    length = myCAM.read_fifo_length();
+    if (length >= MAX_FIFO_SIZE) { // 8mb
+      logln("Picture oversize!");
+      return false;
+    }
+    if (length == 0 ) //0 kb
     {
-      //Write image data to buffer if not full
-      if (i < 256)
-        buf[i++] = temp;
-      else
+      logln("Picture size is 0!");
+      return false;
+    }
+    myCAM.CS_LOW();
+    myCAM.set_fifo_burst();//Set fifo burst mode
+    wdt();
+    while ( length-- )
+    {
+      temp_last = temp;
+      temp =  SPI.transfer(0x00);
+      if (is_header == true)
       {
-        //Write 256 bytes image data to file
-        camera.CS_HIGH();
-        Serial.write(buf, 256);
-        i = 0;
-        buf[i++] = temp;
-        camera.set_fifo_burst();
+        file.write(temp);
       }
+      else if ((temp == 0xD8) & (temp_last == 0xFF))
+      {
+        is_header = true;
+        logln("Image successfully taken");
+        file.write(temp_last);
+        file.write(temp);
+      }
+      if ( (temp == 0xD9) && (temp_last == 0xFF) ) //If find the end ,break while,
+      break;
+      delayMicroseconds(5);
     }
-    else if ((temp == 0xD8) & (temp_last == 0xFF))
-    {
-      is_header = true;
-      camera.CS_HIGH();
-      String fileName = Stime + ".jpg";
+    myCAM.CS_HIGH();
+    is_header = false;
 
-      //outFile = SD.open(fileName, O_WRITE | O_CREAT | O_TRUNC);
-      Serial.flush();
-
-      //if (!outFile)
-      //{
-      //  log(F("File open failed"));
-      //}
-      camera.set_fifo_burst();
-      buf[i++] = temp_last;
-      buf[i++] = temp;
+    wdt();
+    await(50);
+    if(!file.close()) {
+      logln("Failed to close picture file!");
+      await(50);
+      ++tries;
+      continue;
+    }
+    await(50);
+    if(!file.open(oldName, O_WRONLY)) {
+      logln("Failed to open log file, waiting 50ms");
+      await(50);
+      ++tries;
+      continue;
     }
   }
-  camera.CS_HIGH();
-  return 1;
-
+  return true;
 }
-*/
 
 
 
