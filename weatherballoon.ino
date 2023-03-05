@@ -6,6 +6,7 @@
 #include "sdios.h"
 #include "LoRa.h"
 #include "ArduCAM.h"
+#include "hardware/watchdog.h"
 
 // PINS //
 #define IO_MISO D12   //
@@ -53,6 +54,7 @@
 #define WAIT_FOR_DEBUG false
 // set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
 // note that images can take a VERY long time on lower clock speeds (5 seconds), so make sure to include plenty of time around that to avoid accidental resets.
+// also note that if you flash using arduino pico default settings, it will report a reboot as being watchdog when you flash it.
 #define WATCHDOG 8000
 
 
@@ -189,29 +191,42 @@ void setup() {
       return;
     } else {
       // simple check for SD r/w capabilities. deletes the file, create one, write some text, close it. Open it again, read it back, then close and check if they are the same.
-      sd.remove("check.txt");
-      if(!file.open("check.txt", O_WRONLY | O_CREAT)) {
-        logln("Failed to create check file!");
+      if(!file.open("bootrecord.txt", O_WRONLY | O_CREAT | O_AT_END)) {
+        logln("Failed to create open boot record file!");
         fatalerr = true;
       } else {
-        file.print("200 OK");
+        file.print("Boot OK");
+        if(watchdog_enable_caused_reboot()) {
+          file.println(" W: restarted by watchdog!");
+        } else file.println();
         if(!file.close()) {
-          logln("Check file didn't close!");
+          logln("boot record file didn't close!");
           fatalerr = true;
         }
-        if(!file.open("check.txt")) {
-          logln("Failed to open check file!");
+        if(!file.open("bootrecord.txt", O_RDONLY)) {
+          logln("Failed to open boot record file!");
           fatalerr = true;
         }
-        if(file.readString() != "200 OK") {
-          logln("File check was not OK!");
+        uint32_t fs = file.fileSize();
+        uint16_t i = 0;
+        uint16_t w = 0;
+        char buffer[fs];
+        if(file.readBytes(buffer, fs) != fs) {
+          logln("File readback was not OK!");
           fatalerr = true;
         }
+        for(char c : buffer) {
+          if(c == '\n') {
+            ++i;
+          } else if(c == 'W') {
+            ++w;
+          }
+        }
+        log("Found "); logi(i); log(" reboots, of which "); logi(w); logln(" were caused by watchdog");
         if(!file.close()) {
-          logln("Check file didn't close!");
+          logln("boot record file didn't close!");
           fatalerr = true;
         }
-        sd.remove("check.txt");
         if(fatalerr) {
           breathe(GREEN, RED);
           logln("SD failed check!");
@@ -230,7 +245,7 @@ void setup() {
     LoRa.setPins(IO_RADIO, RADIO_RST, RADIO_DIO0);
     LoRa.setSPI(SPI1);
     if(!LoRa.begin(868E6)) {
-      logln("LoRa failed to start!");
+      logln("Radio failed to start!");
       fatalerr = true;
     } else {
       logln("Radio OK");
@@ -267,9 +282,9 @@ void setup() {
       logln("Can't find camera module?!");
       fatalerr = true;
       breathe(YELLOW, RED);
+      return;
     }
-    else logln("Camera OK");
-    delay(100);
+    delay(50);
     camera.set_format(JPEG);
     camera.InitCAM();
     camera.set_bit(ARDUCHIP_TIM, VSYNC_LEVEL_MASK);
@@ -278,6 +293,7 @@ void setup() {
     camera.write_reg(ARDUCHIP_FRAMES, 0x00);
     delay(100);
     cameraSleep();
+    logln("Camera OK");
   }
   wdt();
 
@@ -338,8 +354,8 @@ void loop() {
   } else state = 200;
 
   digitalWrite(LED_BUILTIN, HIGH);
-  // TODO
-  logln(((analogRead(A3) * 3.3) / 65535) * 3);
+  // TODO?
+  //logln(((analogRead(A3) * 3.3) / 65535) * 3);
   pressure = pres.readPressure();
   temperature = temp.readTempC();
   internal_temp = pres.readTemperature();
@@ -387,9 +403,14 @@ void loop() {
   digitalWrite(LED_BUILTIN, LOW);
   long dur = millis() - now;
   if(dur > CYCLE_MILLIHERTZ) {
-    char c[48];
-    snprintf(c, 48, "Running %010i millis behind!", dur);
-    logln(c);
+    if(DEBUG) {
+      char c[48];
+      snprintf(c, 48, "Running %010i millis behind!", dur);
+      logln(c);
+    }
+    // just to make sure that everything is OK
+    await(250);
+    wdt();
     return;
   }
   else await(CYCLE_MILLIHERTZ - dur);
@@ -551,6 +572,7 @@ bool take_picture() {
     breathe(YELLOW, RED);
     return false;
   }
+  wdt();
   //Clear the capture done flag
   camera.clear_fifo_flag();
   delay(50);
@@ -595,16 +617,14 @@ bool read_fifo_burst(ArduCAM myCAM) {
       logln("Picture oversize!");
       return false;
     }
-    if (length == 0 ) //0 kb
-    {
+    if (length == 0) {
       logln("Picture size is 0!");
       return false;
     }
     myCAM.CS_LOW();
-    myCAM.set_fifo_burst();//Set fifo burst mode
+    myCAM.set_fifo_burst(); //Set fifo burst mode
     wdt();
-    while ( length-- )
-    {
+    while (length--) {
       temp_last = temp;
       temp =  SPI.transfer(0x00);
       if (is_header == true)
@@ -617,7 +637,7 @@ bool read_fifo_burst(ArduCAM myCAM) {
         file.write(temp_last);
         file.write(temp);
       }
-      if ( (temp == 0xD9) && (temp_last == 0xFF) ) //If find the end ,break while,
+      if ((temp == 0xD9) && (temp_last == 0xFF)) //If find the end, break while loop
       break;
       delayMicroseconds(5);
     }
@@ -633,12 +653,13 @@ bool read_fifo_burst(ArduCAM myCAM) {
       continue;
     }
     await(50);
-    if(!file.open(oldName, O_WRONLY)) {
+    if(!file.open(oldName, O_WRONLY | O_AT_END)) {
       logln("Failed to open log file, waiting 50ms");
       await(50);
       ++tries;
       continue;
     }
+    await(50);
     logln("Image successfully taken");
     wdt();
     return true;
