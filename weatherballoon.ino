@@ -50,17 +50,20 @@
 #define USE_SD true
 
 // weather or not to send thumbnail (low-res) images over the radio. See CYCLES_PER_THUMBNAIL.
-#define SEND_THUMBNAILS true
+#define SEND_THUMBNAILS false
+
 // weather the system should wait for the GPS to have a data before starting.
 #define WAIT_FOR_GPS false
 // weather the system should wait for USB in order to begin running when DEBUG is true.
 #define WAIT_FOR_DEBUG false
+
 // set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
 // note that images can take a VERY long time on lower clock speeds (5 seconds), so make sure to include plenty of time around that to avoid accidental resets.
 // also note that if you flash using arduino pico default settings, it will report a reboot as being watchdog when you flash it.
 #define WATCHDOG 8000
 // set this value to enable if the system can reboot itself on a fatal error or not.
 #define REBOOT_ON_FATAL true
+
 // enable the CSV header on the data log files.
 #define ENABLE_CSV_HEADER false
 // enable boot record file, which tracks how many times the system has been rebooted.
@@ -218,6 +221,7 @@ void setup() {
         if(watchdog_enable_caused_reboot()) {
           file.println(" W: restarted by watchdog!");
           logln("Rebooted by watchdog!");
+          breathe(PURPLE, RED, 5);
         } else file.println();
         if(!file.close()) {
           logln("boot record file didn't close!");
@@ -751,13 +755,16 @@ bool read_fifo_burst(bool radio) {
     return false;
   }
   if(radio) {
-    uint8_t pckts = ceil(length / 254.0);
+    uint8_t pckts = ceil(length / 255.0);
     log("need to send "); logi(pckts); logln(" packets of image data.");
     LoRa.beginPacket();
     LoRa.print("#");
     LoRa.print(pckts);
     LoRa.print("!");
     LoRa.endPacket();
+    wdt();
+    delay(200);
+    wdt();
     LoRa.beginPacket();
   }
   camera.CS_LOW();
@@ -767,6 +774,9 @@ bool read_fifo_burst(bool radio) {
     if(i == 255) {
       LoRa.endPacket();
       i = 0;
+      wdt();
+      await(200);
+      wdt();
       LoRa.beginPacket();
     }
     temp_last = temp;
@@ -788,10 +798,12 @@ bool read_fifo_burst(bool radio) {
         if(i > 253) {
           LoRa.write(temp_last);
           LoRa.endPacket();
-          i = 0;
+          wdt();
+          delay(200);
+          wdt();
           LoRa.beginPacket();
           LoRa.write(temp);
-          ++i;
+          i = 1;
         } else {
           LoRa.write(temp_last);
           LoRa.write(temp);
@@ -803,7 +815,8 @@ bool read_fifo_burst(bool radio) {
       if(radio) LoRa.endPacket();
       break; // If find the end, break while loop
     }
-    delayMicroseconds(5);
+    if(!radio) delayMicroseconds(5);
+    else delayMicroseconds(50);
   }
   camera.CS_HIGH();
   wdt();
@@ -932,12 +945,8 @@ void update_colors() {
   if(br) {
     if(clrcmp(rgb, trgb)) {
       const uint8_t temp[3] = {trgb[0], trgb[1], trgb[2]};
-      trgb[0] = frgb[0];
-      trgb[1] = frgb[1];
-      trgb[2] = frgb[2];
-      frgb[0] = temp[0];
-      frgb[1] = temp[1];
-      frgb[2] = temp[2];
+      trgb[0] = frgb[0]; trgb[1] = frgb[1]; trgb[2] = frgb[2];
+      frgb[0] = temp[0]; frgb[1] = temp[1]; frgb[2] = temp[2];
       ++brt;
       if(brt == brtcap) {
         brt = 0;

@@ -8,7 +8,7 @@ void setup() {
   Serial.print("initbegin");
 
   if (!LoRa.begin(868E6)) {
-    Serial.print("lorafail");
+    Serial.print("lorafail;");
     while (1);
   }
 
@@ -30,7 +30,7 @@ void loop() {
     while (LoRa.available()) {
       Serial.print((char)LoRa.read());
     }
-    Serial.print("'");
+    Serial.print("';");
   }
 }
 
