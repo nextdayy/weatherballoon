@@ -48,37 +48,54 @@
 #define USE_CAMERA true
 #define USE_RADIO true
 #define USE_SD true
+
+// weather or not to send thumbnail (low-res) images over the radio. See CYCLES_PER_THUMBNAIL.
+#define SEND_THUMBNAILS true
 // weather the system should wait for the GPS to have a data before starting.
-#define WAIT_FOR_GPS true
+#define WAIT_FOR_GPS false
 // weather the system should wait for USB in order to begin running when DEBUG is true.
 #define WAIT_FOR_DEBUG false
 // set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
 // note that images can take a VERY long time on lower clock speeds (5 seconds), so make sure to include plenty of time around that to avoid accidental resets.
 // also note that if you flash using arduino pico default settings, it will report a reboot as being watchdog when you flash it.
 #define WATCHDOG 8000
+// set this value to enable if the system can reboot itself on a fatal error or not.
+#define REBOOT_ON_FATAL true
+// enable the CSV header on the data log files.
+#define ENABLE_CSV_HEADER false
+// enable boot record file, which tracks how many times the system has been rebooted.
+#define ENABLE_BOOTRECORD true
+
+// supported resolutions for OV5642 JPEG: OV5642_320x240, OV5642_640x480, OV5642_1024x768, OV5642_1280x960, OV5642_1600x1200, OV5642_2048x1536, OV5642_2592x1944
+// camera picture resolution that is saved to the SD.
+#define PIC_RESOLUTION OV5642_1280x960
+// camera thumbnail resolution that is sent over the radio. Recommended to be small.
+#define THUMB_RESOLUTION OV5642_320x240
 
 
 // cycle hertz for the system. Basically its clock. Every time this is reached, a sensor sample is taken, and the various cycle counters for the below are incremented.
 #define CYCLE_MILLIHERTZ 2000
 // how many samples should be written to one file before swapping to next one.
 #define CYCLES_PER_FILE 35
-// how many sensor cycles to skip before taking a picture (e.g. 3xSENSOR_SAMPLE_WAIT of 5000 = every 15s)
-#define CYCLES_PER_PIC 30
+// how many sensor cycles to skip before taking a picture (e.g. 15xSENSOR_SAMPLE_WAIT of 2000 = every 30s)
+#define CYCLES_PER_PIC 15
 // how many sensor cycles to skip before sending radio (same as above)
 #define CYCLES_PER_RX 5
+// how many sensor cycles to skip before sending a thumbnail on the radio (same as above)
+#define CYCLES_PER_THUMBNAIL 150
 
 // how many cycles to wait for color updates (does not use the above clock system, much more random for efficiency)
 #define COLOR_UPD_SKIP 800
 // amount of times to try writing before dying.
 #define MAX_SD_TRIES 5
-// amount of times to send each batch of radio data.
+// amount of times to send each batch of radio log data.
 #define RADIO_REPEATS 1
 
 // COLORS // (max of 200 becuase it looks nicer)
 static const uint8_t WHITE[3] = {200, 200, 200};
 static const uint8_t GREEN[3] = {0, 200, 0};      // IO messages
 static const uint8_t PURPLE[3] = {160, 0, 160};   // GPS messages
-static const uint8_t YELLOW[3] = {200, 200, 0};   // camera messages
+static const uint8_t YELLOW[3] = {160, 160, 0};   // camera messages
 static const uint8_t RED[3] = {200, 0, 0};
 static const uint8_t OFF[3] = {0, 0, 0};
 
@@ -106,10 +123,13 @@ uint8_t rgb[3];
 uint8_t trgb[3];
 uint8_t frgb[3];
 bool br = false;
+uint8_t brt = 0;
+uint8_t brtcap = 0;
 
 uint8_t camcycles = 0;
 uint8_t radiocycles = 0;
 uint8_t sdcycles = 0;
+uint8_t thumbcycles = 0;
 bool fatalerr = false;
 bool ready = false;
 
@@ -151,7 +171,6 @@ void setup() {
   // init CS pins
   pinMode(IO_SD, OUTPUT);
   pinMode(IO_RADIO, OUTPUT);
-  //pinMode(CAM_CS, OUTPUT);
   
 
   // init I2C + SPI
@@ -187,7 +206,7 @@ void setup() {
       logln("Failed to init SD Card SPI!");
       if(DEBUG) sd.initErrorPrint(&Serial);
       fatalerr = true;
-      breathe(GREEN, RED);
+      breathe(GREEN, RED, 0);
       return;
     } else {
       // simple check for SD r/w capabilities. deletes the file, create one, write some text, close it. Open it again, read it back, then close and check if they are the same.
@@ -198,6 +217,7 @@ void setup() {
         file.print("Boot OK");
         if(watchdog_enable_caused_reboot()) {
           file.println(" W: restarted by watchdog!");
+          logln("Rebooted by watchdog!");
         } else file.println();
         if(!file.close()) {
           logln("boot record file didn't close!");
@@ -227,8 +247,11 @@ void setup() {
           logln("boot record file didn't close!");
           fatalerr = true;
         }
+        if(!ENABLE_BOOTRECORD) {
+          sd.remove("bootrecord.txt");
+        }
         if(fatalerr) {
-          breathe(GREEN, RED);
+          breathe(GREEN, RED, 0);
           logln("SD failed check!");
           return;
         }
@@ -250,6 +273,7 @@ void setup() {
     } else {
       logln("Radio OK");
     }
+    LoRa.setTxPower(20);
     LoRa.sleep();
     digitalWrite(IO_RADIO, HIGH);
     digitalWrite(IO_SD, LOW);
@@ -260,6 +284,7 @@ void setup() {
   if(USE_CAMERA) {
     uint8_t vid,pid;
     uint8_t state;
+    camera_wake();
     camera.write_reg(0x07, 0x80);
     delay(100);
     camera.write_reg(0x07, 0x00);
@@ -270,7 +295,7 @@ void setup() {
     if(state != 0x55) {
         logln("Camera SPI interface error!");
         fatalerr = true;
-        breathe(YELLOW, RED);
+        breathe(YELLOW, RED, 0);
         return;
     }  
     // Change MCU mode
@@ -278,21 +303,22 @@ void setup() {
     camera.wrSensorReg16_8(0xff, 0x01);
     camera.rdSensorReg16_8(OV5642_CHIPID_HIGH, &vid);
     camera.rdSensorReg16_8(OV5642_CHIPID_LOW, &pid);
+    delay(100);
     if((vid != 0x56) || (pid != 0x42)) {
       logln("Can't find camera module?!");
       fatalerr = true;
-      breathe(YELLOW, RED);
+      breathe(YELLOW, RED, 0);
       return;
     }
     delay(50);
     camera.set_format(JPEG);
     camera.InitCAM();
     camera.set_bit(ARDUCHIP_TIM, VSYNC_LEVEL_MASK);
-    camera.OV5642_set_JPEG_size(OV5642_1280x960);
+    camera.OV5642_set_JPEG_size(PIC_RESOLUTION);
     camera.clear_fifo_flag();   
     camera.write_reg(ARDUCHIP_FRAMES, 0x00);
     delay(100);
-    cameraSleep();
+    camera_sleep();
     logln("Camera OK");
   }
   wdt();
@@ -302,7 +328,7 @@ void setup() {
     if(!temp.begin(0x18, &Wire1)) {
       logln("Failed to initialize temperature sensor!");
       fatalerr = true;
-      breathe(YELLOW, RED);
+      breathe(YELLOW, RED, 0);
       return;
     } else {
       // setup temperature resolution
@@ -312,7 +338,7 @@ void setup() {
     if(!pres.begin_I2C(BMP3XX_DEFAULT_ADDRESS, &Wire1)) {
       logln("Failed to initialize pressure sensor!");
       fatalerr = true;
-      breathe(YELLOW, RED);
+      breathe(YELLOW, RED, 0);
       return;
     } else {
       // setup pressure resolution
@@ -323,7 +349,7 @@ void setup() {
 
   state = 1;
   logln("initialized successfully");
-  if(WAIT_FOR_GPS) breathe(OFF, PURPLE);
+  if(WAIT_FOR_GPS) breathe(OFF, PURPLE, 0);
   else ready = true;
   digitalWrite(LED_BUILTIN, LOW);
   wdt();
@@ -334,12 +360,18 @@ void loop() {
   unsigned long now = millis();
   if(fatalerr) {
     state = 500;
-    logln("Fatal error! Please restart.");
-    await(5000);
+    if(!REBOOT_ON_FATAL) {
+      logln("Fatal error! Please restart.");
+      await(5000);
+    } else {
+      logln("Fatal error! Rebooting in 5 seconds...");
+      await(5000);
+      rp2040.reboot();
+    }
     return;
   }
   wdt();
-  if(!ready && gpsReady()) {
+  if(!ready && gps_ready()) {
     logln("GPS ready, ready!");
     ready = true;
     toColor(OFF);
@@ -368,30 +400,39 @@ void loop() {
       take_picture();
       camcycles = 0;
     }
+    wdt();
   }
-  wdt();
 
   if(USE_SD) {
     ++sdcycles;
-    if(sdcycles == CYCLES_PER_FILE) {
-      incFileSafe();
+    if(sdcycles > CYCLES_PER_FILE) {
+      inc_file();
       sdcycles = 0;
     }
-    writeData();
+    write_data();
+    wdt();
   }
-  wdt();
 
   if(USE_RADIO) {
     ++radiocycles;
     if(radiocycles > CYCLES_PER_RX) {
-      sendRadio();
+      send_radio_data();
       radiocycles = 0;
     }
+    wdt();
   }
-  wdt();
+
+  if(SEND_THUMBNAILS) {
+    ++thumbcycles;
+    if(thumbcycles > CYCLES_PER_THUMBNAIL) {
+      send_thumbnail();
+      thumbcycles = 0;
+    }
+    wdt();
+  }
 
   if(DEBUG) {
-    logln("State\tTime\t\tAlt.\tSpeed\t\tLat\t\tLong\t\tPressure\tTemperature\tInternal Temp\tSatellites");
+    logln("State\tTime\t\tAlt.\tSpeed\t\tLat\t\tLong\t\tPressure\tTemperature\tTemperature 2\tSatellites");
     char cz[128];
     // tasty
     snprintf(cz, 128, "%i\t%02i:%02i:%02i\t%.4fm\t%.4fm/s\t%.6f\t%.6f\t%.4fhPa\t%.4fc\t%.4fc\t%i", state, gps.time.hour(), gps.time.minute(), gps.time.second(), altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temperature, internal_temp, gps.satellites.value());
@@ -400,6 +441,7 @@ void loop() {
 
 
   // wait the remaining time. Use this to prevent a possible negative number in ulong if it takes longer than CYCLE_MILLIHERTZ.
+  wdt();
   digitalWrite(LED_BUILTIN, LOW);
   long dur = millis() - now;
   if(dur > CYCLE_MILLIHERTZ) {
@@ -432,11 +474,11 @@ void await(unsigned long ms) {
     if(USE_LED) {
       ++cycl;
       if(cycl > COLOR_UPD_SKIP) {
-        updateColors();
+        update_colors();
         cycl = 0;
       }
     }
-    if(!fatalerr && USE_GPS) feedGPS();
+    if(!fatalerr && USE_GPS) feed_gps();
   } while (millis() - now < ms);
 }
 
@@ -447,7 +489,7 @@ void await(unsigned long ms) {
 // SD //
 
 // increment the file to a new one, closing the old one. Will try MAX_SD_TRIES before dying.
-bool incFile() {
+bool inc_file() {
   uint8_t tries = 0;
   while(tries <= MAX_SD_TRIES) {
     log("Incrementing file to new one. Attempt ");
@@ -485,7 +527,7 @@ bool incFile() {
     }
 
     // add csv header
-    file.println("state, time, alt, speed, latitude, longitude, pressure, temperature, internaltemperature");
+    if(ENABLE_CSV_HEADER) file.println("state, time, alt, speed, latitude, longitude, pressure, temperature, temp2");
     log("File "); log(cz); logln(" opened. OK");
     return true;
   }
@@ -493,25 +535,25 @@ bool incFile() {
   return false;
 }
 
-inline bool incFileSafe() {
-  if(!incFile()) {
+inline bool inc_file_safe() {
+  if(!inc_file()) {
     logln("FATAL: File increment fail!");
     fatalerr = true;
-    breathe(GREEN, RED);
+    breathe(GREEN, RED, 0);
     return false;
   } 
   return true;
 }
 
 // write the data to the currently open file.
-void writeData() {
+void write_data() {
   if(!file.isOpen()) {
     logln("IllegalStateException: File wasn't open when write was attempted?");
-    if(!incFileSafe()) {
+    if(!inc_file_safe()) {
       logln("Trying one last time!");
       fatalerr = false;
-      cancelBreathe();
-      incFileSafe();
+      stop_breathe();
+      inc_file_safe();
     }
   }
   // plenty of space to avoid overflows
@@ -529,7 +571,7 @@ void writeData() {
 // RADIO //
 
 // send data on the radio RADIO_REPEATS times. Packets start with a ? and end with a !
-void sendRadio() {
+void send_radio_data() {
   digitalWrite(IO_SD, HIGH);
   digitalWrite(IO_RADIO, LOW);
   logln("Sending data on radio...");
@@ -555,38 +597,91 @@ void sendRadio() {
 
 // close the log file, open a picture file and write out the data, then re-open the log.
 bool take_picture() {
-  cameraWake();
+  camera_wake();
   delay(50);
   camera.flush_fifo();
   camera.clear_fifo_flag();
   //Start capture
   camera.start_capture();
   wdt();
+  // it is intentional that wdt is not called in this loop, so that if the camera hangs, the program can still restart.
   while (!camera.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) ;
   
-  logln("Camera took picture successfully");
+  logln("Camera finished taking image, now saving");
   wdt();
-  if(!read_fifo_burst(camera)) {
-    logln("Camera picture failed!");
-    fatalerr = true;
-    breathe(YELLOW, RED);
+
+  char oldName[32];
+  file.getName(oldName, 32);  
+  // I have these in different functions for three reasons:
+  // So I can have them return false if they fail without having to nest loads of indents
+  // so that if it fails I don't have to crash the system
+  // so i can reuse the read_fifo_burst function
+  if(!close_log_and_open_img()) {
+    logln("Error while opening picture file, going to force increment next log!");
+    // set max for next time so it will increment the file
+    breathe(GREEN, RED, 5);
+    sdcycles = 255;
+    return false;
+  }
+  wdt();
+
+  
+  if(!read_fifo_burst(false)) {
+    breathe(YELLOW, RED, 5);
+    logln("Camera picture reading failed!");
     return false;
   }
   wdt();
   //Clear the capture done flag
   camera.clear_fifo_flag();
   delay(50);
-  cameraSleep();
+  camera_sleep();
+
+  if(!close_img_and_reopen_log(oldName)) {
+    logln("Error while closing picture file, going to force increment next log!");
+    // set max for next time so it will increment the file
+    breathe(GREEN, RED, 5);
+    sdcycles = 255;
+    return false;
+  }
   wdt();
+  logln("Image saved successfully");
   return true;
 }
 
-// read the data and actually do the file opening/closing/writing.
-bool read_fifo_burst(ArduCAM myCAM) {
+
+bool send_thumbnail() {
+  camera_wake();
+  camera.OV5642_set_JPEG_size(THUMB_RESOLUTION);
+  delay(50);
+  camera.flush_fifo();
+  camera.clear_fifo_flag();
+  //Start capture
+  camera.start_capture();
+  wdt();
+  // it is intentional that wdt is not called in this loop, so that if the camera hangs, the program can still restart.
+  while (!camera.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) ;
+  
+  logln("Camera finished taking thumbnail, now sending");
+  wdt();
+  if(!read_fifo_burst(true)) {
+    breathe(YELLOW, RED, 5);
+    logln("Camera thumbnail sending failed!");
+    return false;
+  }
+  wdt();
+  //Clear the capture done flag
+  camera.clear_fifo_flag();
+  camera.OV5642_set_JPEG_size(PIC_RESOLUTION);
+  delay(50);
+  camera_sleep();
+  logln("Thumbnail sent successfully");
+  return true;
+}
+
+// close the log file and open a new image file.
+bool close_log_and_open_img() {
   uint8_t tries = 0;
-  bool is_header = false;
-  char oldName[32];
-  file.getName(oldName, 32);
   while(tries < MAX_SD_TRIES) {
     wdt();
     if(!file.close()) {
@@ -607,45 +702,17 @@ bool read_fifo_burst(ArduCAM myCAM) {
       await(50);
       ++tries;
       continue;
+    } else {
+      return true;
     }
-    wdt();
+  }
+  return false;
+}
 
-    uint8_t temp = 0, temp_last = 0;
-    uint32_t length = 0; 
-    length = myCAM.read_fifo_length();
-    if (length >= MAX_FIFO_SIZE) { // 8mb
-      logln("Picture oversize!");
-      return false;
-    }
-    if (length == 0) {
-      logln("Picture size is 0!");
-      return false;
-    }
-    myCAM.CS_LOW();
-    myCAM.set_fifo_burst(); //Set fifo burst mode
+bool close_img_and_reopen_log(char *oldName) {
+  uint8_t tries = 0;
+  while(tries < MAX_SD_TRIES) {
     wdt();
-    while (length--) {
-      temp_last = temp;
-      temp =  SPI.transfer(0x00);
-      if (is_header == true)
-      {
-        file.write(temp);
-      }
-      else if ((temp == 0xD8) & (temp_last == 0xFF))
-      {
-        is_header = true;
-        file.write(temp_last);
-        file.write(temp);
-      }
-      if ((temp == 0xD9) && (temp_last == 0xFF)) //If find the end, break while loop
-      break;
-      delayMicroseconds(5);
-    }
-    myCAM.CS_HIGH();
-    is_header = false;
-
-    wdt();
-    await(50);
     if(!file.close()) {
       logln("Failed to close picture file!");
       await(50);
@@ -658,21 +725,96 @@ bool read_fifo_burst(ArduCAM myCAM) {
       await(50);
       ++tries;
       continue;
+    } else {
+      return true;
     }
-    await(50);
-    logln("Image successfully taken");
-    wdt();
-    return true;
   }
+  return false;
+}
+
+// read the data from the camera, and write to the output to the file or radio if the param is set.
+// modified from the arducam example.
+bool read_fifo_burst(bool radio) {
+  bool is_header = false;
+  uint8_t temp = 0, temp_last = 0;
+  uint8_t i = 0;
+  uint32_t length = 0; 
+  length = camera.read_fifo_length();
+  if (length >= MAX_FIFO_SIZE) { // 8mb
+    logln("Picture oversize!");
+    return false;
+  }
+  if (length == 0) {
+    logln("Picture size is 0!");
+    return false;
+  }
+  if(radio) {
+    uint8_t pckts = ceil(length / 254.0);
+    log("need to send "); logi(pckts); logln(" packets of image data.");
+    LoRa.beginPacket();
+    LoRa.print("#");
+    LoRa.print(pckts);
+    LoRa.print("!");
+    LoRa.endPacket();
+    LoRa.beginPacket();
+  }
+  camera.CS_LOW();
+  camera.set_fifo_burst(); // Set fifo burst mode
+  wdt();
+  while (--length) {
+    if(i == 255) {
+      LoRa.endPacket();
+      i = 0;
+      LoRa.beginPacket();
+    }
+    temp_last = temp;
+    temp = SPI.transfer(0x00);
+    if (is_header == true) {
+      if(!radio) file.write(temp);
+      else {
+        LoRa.write(temp);
+        ++i;
+      }
+    }
+    else if ((temp == 0xD8) & (temp_last == 0xFF)) {
+      is_header = true;
+      if(!radio) {
+        file.write(temp_last);
+        file.write(temp);
+      } else {
+        // ugh.
+        if(i > 253) {
+          LoRa.write(temp_last);
+          LoRa.endPacket();
+          i = 0;
+          LoRa.beginPacket();
+          LoRa.write(temp);
+          ++i;
+        } else {
+          LoRa.write(temp_last);
+          LoRa.write(temp);
+          i+=2;
+        }
+      }
+    }
+    if ((temp == 0xD9) && (temp_last == 0xFF)) {
+      if(radio) LoRa.endPacket();
+      break; // If find the end, break while loop
+    }
+    delayMicroseconds(5);
+  }
+  camera.CS_HIGH();
+  wdt();
   return true;
 }
 
-inline void cameraSleep() {
-  camera.set_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK); 
+
+inline void camera_sleep() {
+  camera.set_bit(ARDUCHIP_GPIO, GPIO_PWDN_MASK); 
 }
 
-inline void cameraWake() {
-  camera.clear_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK); 
+inline void camera_wake() {
+  camera.clear_bit(ARDUCHIP_GPIO, GPIO_PWDN_MASK); 
 }
 
 
@@ -686,7 +828,7 @@ inline void cameraWake() {
 // GPS 
 
 // feed the GPS object.
-inline void feedGPS() {
+inline void feed_gps() {
    while (gpsSS.available()) { gps.encode(gpsSS.read()); }
 }
 
@@ -695,20 +837,16 @@ inline void feedGPS() {
 
 
 // validation
-inline bool tempValid() {
+inline bool temp_valid() {
   return !isinf(temp.readTempC());
 }
 
-inline bool pressureValid() {
-  return true;
-}
-
-inline bool timeValid() {
+inline bool time_valid() {
   return gps.time.isValid() && !(gps.time.hour() == 0 && gps.time.minute() == 0 && gps.time.second() == 0);
 }
 
-inline bool gpsReady() {
-  return timeValid && !(gps.location.lat() == 0 && gps.location.lng() == 0 && gps.altitude.meters() == 0);
+inline bool gps_ready() {
+  return time_valid && !(gps.location.lat() == 0 && gps.location.lng() == 0 && gps.altitude.meters() == 0);
 }
 
 
@@ -761,9 +899,10 @@ inline void wdt() {
 // COLORS //
 
 // update the RGB LED
-void updateColors() {
+void update_colors() {
+  if(clrcmp(OFF, rgb)) return;
   if(trgb[0] > rgb[0]) {
-    rgb[0]++;
+    ++rgb[0];
     analogWrite(LED_R, rgb[0]);
   }
   else if(trgb[0] < rgb[0]) {
@@ -772,7 +911,7 @@ void updateColors() {
   }
 
   if(trgb[1] > rgb[1]) {
-    rgb[1]++;
+    ++rgb[1];
     analogWrite(LED_G, rgb[1]);
   }
   else if(trgb[1] < rgb[1]) {
@@ -781,7 +920,7 @@ void updateColors() {
   }
 
   if(trgb[2] > rgb[2]) {
-    rgb[2]++;
+    ++rgb[2];
     analogWrite(LED_B, rgb[2]);
   }
   else if(trgb[2] < rgb[2]) {
@@ -789,7 +928,7 @@ void updateColors() {
     analogWrite(LED_B, rgb[2]);
   }
   if(br) {
-    if(colorcmp(rgb, trgb)) {
+    if(clrcmp(rgb, trgb)) {
       const uint8_t temp[3] = {trgb[0], trgb[1], trgb[2]};
       trgb[0] = frgb[0];
       trgb[1] = frgb[1];
@@ -797,6 +936,13 @@ void updateColors() {
       frgb[0] = temp[0];
       frgb[1] = temp[1];
       frgb[2] = temp[2];
+      ++brt;
+      if(brt == brtcap) {
+        brt = 0;
+        brtcap = 0;
+        br = false;
+        toColor(OFF);
+      }
     }
   }
 }
@@ -806,6 +952,8 @@ void toColor(const uint8_t to[3]) {
   trgb[1] = to[1];
   trgb[2] = to[2];
   br = false;
+  brt = 0;
+  brtcap = 0;
 }
 
 void color(const uint8_t to[3]) {
@@ -813,10 +961,12 @@ void color(const uint8_t to[3]) {
   rgb[1] = to[1];
   rgb[2] = to[2];
   br = false;
+  brt = 0;
+  brtcap = 0;
 }
 
-void breathe(const uint8_t from[3], const uint8_t to[3]) {
-  if(!colorcmp(from, rgb)) {
+void breathe(const uint8_t from[3], const uint8_t to[3], uint8_t times) {
+  if(!clrcmp(from, rgb)) {
     color(from);
   }
   toColor(to);
@@ -824,14 +974,17 @@ void breathe(const uint8_t from[3], const uint8_t to[3]) {
   frgb[1] = from[1];
   frgb[2] = from[2];
   br = true;
+  brtcap = times;
 }
 
-inline bool colorcmp(const uint8_t a[3], const uint8_t b[3]) {
+inline bool clrcmp(const uint8_t a[3], const uint8_t b[3]) {
   return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
 }
 
-inline void cancelBreathe() {
+inline void stop_breathe() {
   br = false;
+  brt = 0;
+  brtcap = 0;
   color(OFF);
 }
 
