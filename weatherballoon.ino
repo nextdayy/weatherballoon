@@ -406,7 +406,7 @@ void loop() {
   if(USE_SD) {
     ++sdcycles;
     if(sdcycles > CYCLES_PER_FILE) {
-      inc_file();
+      inc_file_safe();
       sdcycles = 0;
     }
     write_data();
@@ -597,6 +597,7 @@ void send_radio_data() {
 
 // close the log file, open a picture file and write out the data, then re-open the log.
 bool take_picture() {
+  logln("Taking picture");
   camera_wake();
   delay(50);
   camera.flush_fifo();
@@ -651,6 +652,7 @@ bool take_picture() {
 
 
 bool send_thumbnail() {
+  logln("Sending thumbnail image");
   camera_wake();
   camera.OV5642_set_JPEG_size(THUMB_RESOLUTION);
   delay(50);
