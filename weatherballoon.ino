@@ -77,13 +77,16 @@
 // weather or not to send thumbnail (low-res) images over the radio. See CYCLES_PER_THUMBNAIL.
 #define SEND_THUMBNAILS true
 
+// weather or not to use flight mode for the GPS, a feature provided for many uBLOX GPS systems.
+// it optimizes the GPS for low temperature and high altitude usage.
+#define GPS_FLIGHTMODE true
 // weather the system should wait for the GPS to have a data before starting.
 #define WAIT_FOR_GPS true
 // weather the system should wait for USB serial in order to begin running when DEBUG is true.
 #define WAIT_FOR_DEBUG false
 
 // set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
-// note that images can take a VERY long time on lower clock speeds (5 seconds), along with radio signals on high spreading factors (enable RADIO_ASYNC)
+// note that images can take a VERY long time on lower clock speeds (5 seconds), along with radio signals on high spreading factors.
 // so make sure to include plenty of time around that to avoid accidental resets.
 // also note that if you flash using arduino pico default settings, it will report a reboot as being watchdog when you flash it.
 #define WATCHDOG 8000
@@ -241,13 +244,26 @@ void setup() {
     SPI1.setSCK(IO_SCK);
   }
 
-  logln("Communication buses OK");
-
   if(USE_GPS) {
     // init gps
     Serial1.setTX(GPS_TX);
     Serial1.setRX(GPS_RX);
     Serial1.begin(9600);
+    if(GPS_FLIGHTMODE) {
+      delay(100); // let the GPS start
+      uint8_t flightMode[] = {
+        0xB5, 0x62, 0x06, 0x24, 0x24, 0x00, 0xFF, 0xFF, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 
+        0x05, 0x00, 0xFA, 0x00, 0xFA, 0x00, 0x64, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xDC 
+      };
+      sendUBX(flightMode, sizeof(flightMode) / sizeof(uint8_t));
+      if(!getUBX_ACK(flightMode)) {
+        logln("GPS Flight mode configuration error!");
+        fatalerr = true;
+        breathe(GREEN, RED, 0);
+        return;
+      } else log(" -> ");
+    }
     logln("GPS OK");
   }
   wdt();
@@ -641,7 +657,6 @@ void write_data() {
 
 // send data on the radio RADIO_REPEATS times.
 void send_radio_data() {
-  return;
   digitalWrite(IO_SD, HIGH);
   digitalWrite(IO_RADIO, LOW);
   logln("Sending data on radio...");
@@ -946,6 +961,72 @@ inline void camera_wake() {
 inline void feed_gps() {
   while (Serial1.available()) { 
     gps.encode(Serial1.read());
+  }
+}
+
+/** thanks to https://ukhas.org.uk/doku.php?id=guides:ublox6 for this! */
+
+// Send a byte array of UBX protocol to the GPS
+void sendUBX(uint8_t *MSG, uint8_t len) {
+  for(int i=0; i<len; i++) {
+    Serial1.write(MSG[i]);
+  }
+  Serial1.println();
+}
+ 
+ 
+// Calculate expected UBX ACK packet and parse UBX response from GPS
+boolean getUBX_ACK(uint8_t *MSG) {
+  wdt();
+  uint8_t b;
+  uint8_t ackByteID = 0;
+  uint8_t ackPacket[10];
+  unsigned long startTime = millis();
+ 
+  // Construct the expected ACK packet    
+  ackPacket[0] = 0xB5;	// header
+  ackPacket[1] = 0x62;	// header
+  ackPacket[2] = 0x05;	// class
+  ackPacket[3] = 0x01;	// id
+  ackPacket[4] = 0x02;	// length
+  ackPacket[5] = 0x00;
+  ackPacket[6] = MSG[2];	// ACK class
+  ackPacket[7] = MSG[3];	// ACK id
+  ackPacket[8] = 0;		// CK_A
+  ackPacket[9] = 0;		// CK_B
+ 
+  // Calculate the checksums
+  for (uint8_t i=2; i<8; i++) {
+    ackPacket[8] = ackPacket[8] + ackPacket[i];
+    ackPacket[9] = ackPacket[9] + ackPacket[8];
+  }
+  while (true) {
+    // Test for success
+    if (ackByteID > 9) {
+      // All packets in order, Ok!
+      wdt();
+      return true;
+    }
+ 
+    // Timeout if no valid response in 3 seconds
+    if (millis() - startTime > 3000) { 
+      wdt();
+      return false;
+    }
+ 
+    // Make sure data is available to read
+    if (Serial1.available()) {
+      b = Serial1.read();
+ 
+      // Check that bytes arrive in sequence as per expected ACK packet
+      if (b == ackPacket[ackByteID]) { 
+        ackByteID++;
+        if(DEBUG) Serial.print(b, HEX);
+      } 
+      else {
+        ackByteID = 0;	// Reset and look again, invalid order
+      }
+    }
   }
 }
 
