@@ -1,3 +1,28 @@
+/** 
+ * Weather Balloon controller v1.0 by nextdaydelivery
+ * Weather balloon datalogger project. Powered by the Raspberry Pi Pico.
+ * https://github.com/nxtdaydelivery/weatherballoon
+ * 
+ * Licensed under the MIT License - Copyright (c) 2023 nextdaydelivery
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 #include "TinyGPSPlus.h"
 #include "Adafruit_BMP3XX.h"
 #include "Adafruit_MCP9808.h"
@@ -41,7 +66,7 @@
 #define LED_B D26
 
 // STATES //
-#define DEBUG false   // serial output
+#define DEBUG true   // serial output
 #define USE_LED true
 #define USE_GPS true
 #define USE_I2C true
@@ -50,11 +75,11 @@
 #define USE_SD true
 
 // weather or not to send thumbnail (low-res) images over the radio. See CYCLES_PER_THUMBNAIL.
-#define SEND_THUMBNAILS false
+#define SEND_THUMBNAILS true
 
 // weather the system should wait for the GPS to have a data before starting.
 #define WAIT_FOR_GPS true
-// weather the system should wait for USB in order to begin running when DEBUG is true.
+// weather the system should wait for USB serial in order to begin running when DEBUG is true.
 #define WAIT_FOR_DEBUG false
 
 // set this value to a positive integer to enable the watchdog. The value is the ms between polls that has to be reached before resetting. Max: 8300
@@ -69,33 +94,31 @@
 
 // enable the CSV header on the data log files.
 #define ENABLE_CSV_HEADER false
-// enable boot record file, which tracks how many times the system has been rebooted.
+// enable boot record file, which tracks how many times the system has been rebooted and by watchdog.
 #define ENABLE_BOOTRECORD true
+// amount of times to try writing, opening, sending on radio (IO operations) etc. before crashing.
+#define MAX_IO_TRIES 5
 
 // supported resolutions for OV5642 JPEG: OV5642_320x240, OV5642_640x480, OV5642_1024x768, OV5642_1280x960, OV5642_1600x1200, OV5642_2048x1536, OV5642_2592x1944
-// note that larger sensor images doesn't necessarily mean better pictures. This value is chosen becuase it seems to be a good balance between file size, speed and picture quality.
+// note that larger sensor images doesn't necessarily mean better pictures. The default of 1280x960 is chosen becuase it seems to be a good balance between file size, speed and picture quality.
 // camera picture resolution that is saved to the SD.
 #define PIC_RESOLUTION OV5642_1280x960
-// camera thumbnail resolution that is sent over the radio. Recommended to be small.
+// camera thumbnail resolution that is sent over the radio. Recommended to be small, especially when using a high spreading factor.
 #define THUMB_RESOLUTION OV5642_320x240
 
 // spreading factor for the radio. This affects the long-range performance of the radio, at the cost of speed and power.
 // see https://www.thethingsnetwork.org/docs/lorawan/spreading-factors/
 // range 6-12 (with 12 being highest range but slowest and highest power consumption). Default 7.
-// be careful with the watchdog on this as well.
 #define RADIO_SPREAD_FACTOR 12
 // amount of times to send each batch of radio log data.
-// note that using this with a high spreading factor isn't necessarily a good idea.
-// incompatible with RADIO_TXASYNC.
+// note that using this with a high spreading factor isn't necessarily a good idea (it will use a LOT of time + power)
 #define RADIO_REPEATS 1
-// weather or not to use asyncronous transmit radio mode.
-// this comes with less 'guarantees' that the packet was successfully sent.
-#define RADIO_TXASYNC true
 
 
-// cycle hertz for the system. Basically its clock. Every time this is reached, a sensor sample is taken, and the various cycle counters for the below are incremented.
+// cycle millihertz (how many milliseconds between samples) for the system. Basically its clock. Every time this is reached, a sensor sample is taken, and the various cycle counters for the below are incremented.
+// very low values are not a good idea, and will waste power.
 #define CYCLE_MILLIHERTZ 2000
-// how many samples should be written to one file before swapping to next one.
+// how many samples should be written to one file before swapping to next one. Default: 35. This means 4kb/file.
 #define CYCLES_PER_FILE 35
 // how many sensor cycles to skip before taking a picture (e.g. 15xSENSOR_SAMPLE_WAIT of 2000 = every 30s)
 #define CYCLES_PER_PIC 15
@@ -103,11 +126,17 @@
 #define CYCLES_PER_RX 15
 // how many sensor cycles to skip before sending a thumbnail on the radio (same as above)
 #define CYCLES_PER_THUMBNAIL 150
+// how many sensor cycles to do before turning off the radio. (same as above)
+// use this if you anticipate the payload to go out of range before the flight ends. 0 to disable.
+#define CYCLES_RADIO 0
 
 // how many cycles to wait for color updates (does not use the above clock system, much more random for efficiency)
+// This value controls the breathe speed of the LED basically. Set this value to whatever you think looks best for you.
+// lower number = faster breathing, higher = slower
 #define COLOR_UPD_SKIP 800
-// amount of times to try writing before dying.
-#define MAX_SD_TRIES 5
+
+
+
 
 // COLORS // (max of 200 becuase it looks nicer)
 static const uint8_t WHITE[3] = {200, 200, 200};
@@ -125,8 +154,6 @@ Adafruit_BMP3XX pres = Adafruit_BMP3XX();
 
 // gps object
 TinyGPSPlus gps;
-// GPS Software Serial
-SoftwareSerial gpsSS(GPS_RX, GPS_TX);
 
 // sd object
 SdFat32 sd;
@@ -137,19 +164,31 @@ File32 file;
 ArduCAM camera(OV5642, CAM_CS);
 
 // color data
-uint8_t rgb[3];
+uint8_t rgb[3]; 
 uint8_t trgb[3];
 uint8_t frgb[3];
 bool br = false;
-uint8_t brt = 0;
+uint8_t brt = 0; 
 uint8_t brtcap = 0;
 
-uint8_t camcycles = 0;
-uint8_t radiocycles = 0;
-uint8_t sdcycles = 0;
-uint8_t thumbcycles = 0;
+// cycling data
+uint8_t camcycles = 0; 
+uint8_t radiocycles = 0; 
+uint8_t sdcycles = 0; 
+uint8_t thumbcycles = 0; 
+uint32_t radiotimes = 0;
+
+// image data
+uint32_t img_length = 0; 
+uint32_t sent_bytes = 0;
+uint8_t sent_pckts = 0;
+uint8_t pckts_to_send = 0;
+
+// flags
 bool fatalerr = false;
+// WatchDog Rebooted flag
 bool wdr = false;
+// weather the system is ready (controlled by WAIT_FOR_GPS and gps_ready())
 bool ready = false;
 
 // data
@@ -173,10 +212,10 @@ void setup() {
     Serial.print(rp2040.f_cpu() / 1000000);
     Serial.print("MHz. ");
   }
+  wdr = watchdog_caused_reboot();
 
   if(WATCHDOG > 0) {
     logln("Watchdog enabled!");
-    wdr = watchdog_enable_caused_reboot();
     rp2040.wdt_begin(WATCHDOG);
   } else logln("");
 
@@ -193,27 +232,22 @@ void setup() {
   pinMode(IO_RADIO, OUTPUT);
   
 
-  // init I2C + SPI
+  // init I2C + SPI + Serial1 for GPS (UART0)
   //analogReadResolution(12);
-  SPI.setTX(CAM_MOSI);
-  SPI.setRX(CAM_MISO);
-  SPI.setSCK(CAM_SCK);
-  SPI.begin();
-  SPI1.setRX(IO_MISO);
-  SPI1.setTX(IO_MOSI);
-  SPI1.setSCK(IO_SCK);
-  Wire.setSCL(CAM_SCL);
-  Wire.setSDA(CAM_SDA);
-  Wire.begin();
-  Wire1.setSDA(I2C_SDA);
-  Wire1.setSCL(I2C_SCL);
-  Wire1.begin();
+  
+  if(USE_RADIO || USE_SD) {
+    SPI1.setRX(IO_MISO);
+    SPI1.setTX(IO_MOSI);
+    SPI1.setSCK(IO_SCK);
+  }
 
   logln("Communication buses OK");
 
   if(USE_GPS) {
     // init gps
-    gpsSS.begin(9600);
+    Serial1.setTX(GPS_TX);
+    Serial1.setRX(GPS_RX);
+    Serial1.begin(9600);
     logln("GPS OK");
   }
   wdt();
@@ -296,6 +330,7 @@ void setup() {
     }
     LoRa.setTxPower(20);
     LoRa.setSpreadingFactor(RADIO_SPREAD_FACTOR);
+    if(SEND_THUMBNAILS) LoRa.onTxDone(thumbnail_send);
     LoRa.sleep();
     digitalWrite(IO_RADIO, HIGH);
     digitalWrite(IO_SD, LOW);
@@ -303,7 +338,14 @@ void setup() {
   wdt();
 
   // init camera
-  if(USE_CAMERA) {
+  if(USE_CAMERA || SEND_THUMBNAILS) {
+    SPI.setTX(CAM_MOSI);
+    SPI.setRX(CAM_MISO);
+    SPI.setSCK(CAM_SCK);
+    Wire.setSCL(CAM_SCL);
+    Wire.setSDA(CAM_SDA);
+    Wire.begin();
+    SPI.begin();
     uint8_t vid,pid;
     uint8_t state;
     camera_wake();
@@ -347,6 +389,9 @@ void setup() {
 
   // init i2c devices
   if(USE_I2C) {
+    Wire1.setSDA(I2C_SDA);
+    Wire1.setSCL(I2C_SCL);
+    Wire1.begin();
     if(!temp.begin(0x18, &Wire1)) {
       logln("Failed to initialize temperature sensor!");
       fatalerr = true;
@@ -436,21 +481,23 @@ void loop() {
   }
 
   if(USE_RADIO) {
-    ++radiocycles;
-    if(radiocycles > CYCLES_PER_RX) {
-      send_radio_data();
-      radiocycles = 0;
+    if(CYCLES_RADIO == 0 || !radiotimes > CYCLES_RADIO) {
+      ++radiocycles;
+      if(radiocycles > CYCLES_PER_RX) {
+        send_radio_data();
+        radiocycles = 0;
+        wdt();
+      }
+      if(SEND_THUMBNAILS) {
+        ++thumbcycles;
+        if(thumbcycles > CYCLES_PER_THUMBNAIL) {
+          thumbnail_begin();
+          thumbcycles = 0;
+          wdt();
+        }
+      }
+      ++radiotimes;
     }
-    wdt();
-  }
-
-  if(SEND_THUMBNAILS) {
-    ++thumbcycles;
-    if(thumbcycles > CYCLES_PER_THUMBNAIL) {
-      send_thumbnail();
-      thumbcycles = 0;
-    }
-    wdt();
   }
 
   if(DEBUG) {
@@ -510,10 +557,10 @@ void await(unsigned long ms) {
 
 // SD //
 
-// increment the file to a new one, closing the old one. Will try MAX_SD_TRIES before dying.
+// increment the file to a new one, closing the old one. Will try MAX_IO_TRIES before dying.
 bool inc_file() {
   uint8_t tries = 0;
-  while(tries <= MAX_SD_TRIES) {
+  while(tries <= MAX_IO_TRIES) {
     log("Incrementing file to new one. Attempt ");
     logi(tries);
     logln(".");
@@ -594,6 +641,7 @@ void write_data() {
 
 // send data on the radio RADIO_REPEATS times.
 void send_radio_data() {
+  return;
   digitalWrite(IO_SD, HIGH);
   digitalWrite(IO_RADIO, LOW);
   logln("Sending data on radio...");
@@ -604,7 +652,7 @@ void send_radio_data() {
     snprintf(cz, 80, "%03i;%.1f;%.8f;%.8f;%.8f;%.6f;%.8f", state, altitude, gps.speed.mps(), gps.location.lat(), gps.location.lng(), pressure, temp2);
     LoRa.print(cz);
     wdt();
-    LoRa.endPacket(RADIO_TXASYNC);
+    LoRa.endPacket();
     wdt();
     i++;
   }
@@ -612,6 +660,18 @@ void send_radio_data() {
   LoRa.sleep();
   digitalWrite(IO_RADIO, HIGH);
   digitalWrite(IO_SD, LOW);
+}
+
+inline bool begin_packet_safe() {
+  uint8_t i = 0;
+  while(i < MAX_IO_TRIES) {
+    if(LoRa.beginPacket()) return true;
+    logln("Radio busy? Trying again in 100ms");
+    await(100);
+    ++i;
+  }
+  logln("Error: radio didn't free!");
+  return false;
 }
 
 
@@ -623,6 +683,7 @@ void send_radio_data() {
 bool take_picture() {
   logln("Taking picture");
   camera_wake();
+  camera.OV5642_set_JPEG_size(PIC_RESOLUTION);
   delay(50);
   camera.flush_fifo();
   camera.clear_fifo_flag();
@@ -650,8 +711,7 @@ bool take_picture() {
   }
   wdt();
 
-  
-  if(!read_fifo_burst(false)) {
+  if(!read_img_length() || !read_img()) {
     breathe(YELLOW, RED, 5);
     logln("Camera picture reading failed!");
     return false;
@@ -674,46 +734,10 @@ bool take_picture() {
   return true;
 }
 
-
-bool send_thumbnail() {
-  digitalWrite(IO_SD, HIGH);
-  digitalWrite(IO_RADIO, LOW);
-  logln("Sending thumbnail image");
-  camera_wake();
-  camera.OV5642_set_JPEG_size(THUMB_RESOLUTION);
-  delay(50);
-  camera.flush_fifo();
-  camera.clear_fifo_flag();
-  //Start capture
-  camera.start_capture();
-  wdt();
-  // it is intentional that wdt is not called in this loop, so that if the camera hangs, the program can still restart.
-  while (!camera.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) ;
-  
-  logln("Camera finished taking thumbnail, now sending");
-  wdt();
-  if(!read_fifo_burst(true)) {
-    breathe(YELLOW, RED, 5);
-    logln("Camera thumbnail sending failed!");
-    return false;
-  }
-  wdt();
-  //Clear the capture done flag
-  camera.clear_fifo_flag();
-  camera.OV5642_set_JPEG_size(PIC_RESOLUTION);
-  delay(50);
-  camera_sleep();
-  LoRa.sleep();
-  digitalWrite(IO_RADIO, HIGH);
-  digitalWrite(IO_SD, LOW);
-  logln("Thumbnail sent successfully");
-  return true;
-}
-
 // close the log file and open a new image file.
 bool close_log_and_open_img() {
   uint8_t tries = 0;
-  while(tries < MAX_SD_TRIES) {
+  while(tries < MAX_IO_TRIES) {
     wdt();
     if(!file.close()) {
       logln("Failed to close log file, waiting 50ms");
@@ -742,7 +766,7 @@ bool close_log_and_open_img() {
 
 bool close_img_and_reopen_log(char *oldName) {
   uint8_t tries = 0;
-  while(tries < MAX_SD_TRIES) {
+  while(tries < MAX_IO_TRIES) {
     wdt();
     if(!file.close()) {
       logln("Failed to close picture file!");
@@ -763,82 +787,40 @@ bool close_img_and_reopen_log(char *oldName) {
   return false;
 }
 
-// read the data from the camera, and write to the output to the file or radio if the param is set.
-// modified from the arducam example.
-bool read_fifo_burst(bool radio) {
-  bool is_header = false;
-  uint8_t temp = 0, temp_last = 0;
-  uint8_t i = 0;
-  uint32_t length = 0; 
-  length = camera.read_fifo_length();
-  if (length >= MAX_FIFO_SIZE) { // 8mb
+bool read_img_length() {
+  img_length = camera.read_fifo_length();
+  if (img_length >= MAX_FIFO_SIZE) { // 8mb
+    img_length = 0;
     logln("Picture oversize!");
     return false;
   }
-  if (length == 0) {
+  if (img_length == 0) {
     logln("Picture size is 0!");
     return false;
   }
-  if(radio) {
-    uint8_t pckts = ceil(length / 255.0);
-    log("need to send "); logi(pckts); logln(" packets of image data.");
-    LoRa.beginPacket();
-    LoRa.print(pckts);
-    wdt();
-    LoRa.endPacket();
-    wdt();
-    LoRa.beginPacket();
-  }
+  return true;
+}
+
+// read the data from the camera, and write to the output to the file.
+// modified from the arducam example.
+bool read_img() {
+  bool is_header = false;
+  uint8_t temp = 0, temp_last = 0;
   camera.CS_LOW();
   camera.set_fifo_burst(); // Set fifo burst mode
   wdt();
-  while (--length) {
-    if(i == 255) {
-      wdt();
-      LoRa.endPacket();
-      wdt();
-      i = 0;
-      LoRa.beginPacket();
-    }
+  while (--img_length) {
     temp_last = temp;
     temp = SPI.transfer(0x00);
     if (is_header == true) {
-      if(!radio) file.write(temp);
-      else {
-        LoRa.write(temp);
-        ++i;
-      }
+      file.write(temp);
     }
     else if ((temp == 0xD8) & (temp_last == 0xFF)) {
       is_header = true;
-      if(!radio) {
-        file.write(temp_last);
-        file.write(temp);
-      } else {
-        // ugh.
-        if(i > 253) {
-          LoRa.write(temp_last);
-          wdt();
-          LoRa.endPacket();
-          wdt();
-          LoRa.beginPacket();
-          LoRa.write(temp);
-          i = 1;
-        } else {
-          LoRa.write(temp_last);
-          LoRa.write(temp);
-          i+=2;
-        }
-      }
+      file.write(temp_last);
+      file.write(temp);
     }
-    if ((temp == 0xD9) && (temp_last == 0xFF)) {
-      if(radio) {
-        wdt();
-        LoRa.endPacket();
-        wdt();
-      }
-      break; // If find the end, break while loop
-    }
+    if ((temp == 0xD9) && (temp_last == 0xFF)) break; // end of the image
     delayMicroseconds(5);
   }
   camera.CS_HIGH();
@@ -846,6 +828,101 @@ bool read_fifo_burst(bool radio) {
   return true;
 }
 
+bool thumbnail_begin() {
+  if(pckts_to_send != 0) {
+    logln("Warning: attempted to send a thumbnail while the radio hadn't finished sending the last one!");
+    return false;
+  }
+  logln("Sending thumbnail image");
+  camera_wake();
+  camera.OV5642_set_JPEG_size(THUMB_RESOLUTION);
+  delay(50);
+  camera.flush_fifo();
+  camera.clear_fifo_flag();
+  //Start capture
+  camera.start_capture();
+  wdt();
+  // it is intentional that wdt is not called in this loop, so that if the camera hangs, the program can still restart.
+  while (!camera.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK)) ;
+  
+  logln("Camera finished taking thumbnail, now sending.");
+  //Clear the capture done flag
+  camera.clear_fifo_flag();
+  if(!read_img_length()) {
+    breathe(YELLOW, RED, 5);
+    logln("Camera thumbnail length reading failed!");
+    return false;
+  }
+  wdt();
+  sent_bytes = 0;
+  sent_pckts = 0;
+  pckts_to_send = ceil(img_length / 254.0);
+  // send the amount of packets the reciever should expect.
+  digitalWrite(IO_SD, HIGH);
+  digitalWrite(IO_RADIO, LOW);
+  LoRa.beginPacket();
+  LoRa.print("L"); LoRa.print(pckts_to_send); LoRa.print("");
+  LoRa.endPacket();
+  // no need to change pins as they will be reset by thumbnail_send
+  wdt();
+  await(100);
+  thumbnail_send();
+  return true;
+}
+
+void thumbnail_send() {
+  if(sent_pckts == pckts_to_send) {
+    logln("Finished sending image!");
+    sent_pckts = 0;
+    pckts_to_send = 0;
+    sent_bytes = 0;
+    LoRa.sleep();
+    return;
+  }
+  digitalWrite(IO_SD, HIGH);
+  digitalWrite(IO_RADIO, LOW);
+  bool is_header = false;
+  uint8_t temp = 0, temp_last = 0;
+  uint8_t i = 0;
+  uint8_t m = 0;
+  camera.CS_LOW();
+  camera_wake();
+  // fallback if radio is busy
+  wdt();
+  if(!begin_packet_safe()) {
+    sent_pckts = 0;
+    pckts_to_send = 0;
+    sent_bytes = 0;
+    LoRa.sleep();
+    return;
+  }
+  // crude fix for two byte writes
+  m = min(254, img_length - sent_bytes);
+  log("Sending thumbnail packet ("); logi(sent_pckts); log("/"); logi(pckts_to_send); log("); length "); logi(m); logln(" bytes");
+  while (i < m) {
+    temp_last = temp;
+    temp = SPI.transfer(0x00);
+    if (is_header == true) {
+      LoRa.write(temp);
+    } else if ((temp == 0xD8) & (temp_last == 0xFF)) {
+      is_header = true;
+      LoRa.write(temp_last);
+      LoRa.write(temp);
+      ++i;
+    }
+    if ((temp == 0xD9) && (temp_last == 0xFF)) break; // end of the image
+    delayMicroseconds(5);
+    ++i;
+    ++sent_bytes;
+  }
+  ++sent_pckts; 
+  LoRa.endPacket(true);
+  camera.CS_HIGH();
+  camera_sleep();
+  digitalWrite(IO_SD, LOW);
+  digitalWrite(IO_RADIO, HIGH);
+  wdt();
+}
 
 inline void camera_sleep() {
   camera.set_bit(ARDUCHIP_GPIO, GPIO_PWDN_MASK); 
@@ -867,7 +944,9 @@ inline void camera_wake() {
 
 // feed the GPS object.
 inline void feed_gps() {
-   while (gpsSS.available()) { gps.encode(gpsSS.read()); }
+  while (Serial1.available()) { 
+    gps.encode(Serial1.read());
+  }
 }
 
 
@@ -924,6 +1003,10 @@ inline void logi(int num) {
   if(DEBUG) Serial.print(num);
 }
 
+inline void log(char c) {
+  if(DEBUG) Serial.print(c);
+}
+
 // poll the watchdog
 inline void wdt() {
   if(WATCHDOG > 0) rp2040.wdt_reset();
@@ -970,12 +1053,14 @@ void update_colors() {
       const uint8_t temp[3] = {trgb[0], trgb[1], trgb[2]};
       trgb[0] = frgb[0]; trgb[1] = frgb[1]; trgb[2] = frgb[2];
       frgb[0] = temp[0]; frgb[1] = temp[1]; frgb[2] = temp[2];
-      ++brt;
-      if(brt == brtcap) {
-        brt = 0;
-        brtcap = 0;
-        br = false;
-        toColor(OFF);
+      if(brtcap != 0) {
+        ++brt;
+        if(brt == brtcap) {
+          brt = 0;
+          brtcap = 0;
+          br = false;
+          toColor(OFF);
+        }
       }
     }
   }
