@@ -33,6 +33,16 @@
 #include "ArduCAM.h"
 #include "hardware/watchdog.h"
 
+// HARDWARE //
+#define DEBUG true   // serial output
+#define USE_LED true
+#define USE_GPS true
+#define USE_I2C true
+#define USE_CAMERA true
+#define USE_RADIO true
+#define USE_SD true
+
+
 // PINS //
 #define IO_MISO D12   //
 #define IO_MOSI D11   // aka SPI1
@@ -65,14 +75,8 @@
 #define LED_G D27
 #define LED_B D26
 
-// STATES //
-#define DEBUG true   // serial output
-#define USE_LED true
-#define USE_GPS true
-#define USE_I2C true
-#define USE_CAMERA true
-#define USE_RADIO true
-#define USE_SD true
+
+// SETTINGS //
 
 // weather or not to send thumbnail (low-res) images over the radio. See CYCLES_PER_THUMBNAIL.
 #define SEND_THUMBNAILS false
@@ -81,7 +85,7 @@
 // it optimizes the GPS for low temperature and high altitude usage.
 #define GPS_FLIGHTMODE true
 // weather the system should wait for the GPS to have a data before starting.
-#define WAIT_FOR_GPS true
+#define WAIT_FOR_GPS false
 // weather the system should wait for USB serial in order to begin running when DEBUG is true.
 #define WAIT_FOR_DEBUG false
 
