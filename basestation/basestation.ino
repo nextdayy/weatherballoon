@@ -14,7 +14,7 @@ void setup() {
 
   // Uncomment the next line to disable the default AGC and set LNA gain, values between 1 - 6 are supported
   // LoRa.setGain(6);
-  LoRa.setSpreadingFactor(12);
+  //LoRa.setSpreadingFactor(12);
 
   // put the radio into receive mode
   LoRa.receive();
