@@ -85,7 +85,7 @@
 // it optimizes the GPS for low temperature and high altitude usage.
 #define GPS_FLIGHTMODE true
 // weather the system should wait for the GPS to have a data before starting.
-#define WAIT_FOR_GPS false
+#define WAIT_FOR_GPS true
 // weather the system should wait for USB serial in order to begin running when DEBUG is true.
 #define WAIT_FOR_DEBUG false
 
